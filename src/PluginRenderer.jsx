@@ -1,68 +1,52 @@
-import React, { useEffect, useRef } from 'react';
-import pluginCss from './plugin.css?raw';
+import React, { Suspense, lazy } from 'react';
+
+// Map plugin IDs to their new component paths
+const pluginMap = {
+  'hub-dashboard': lazy(() => import('./plugins/HubDashboard.jsx')),
+  'project-manager': lazy(() => import('./plugins/ProjectManager.jsx')),
+  'quote-configurator': lazy(() => import('./plugins/QuoteConfigurator.jsx')),
+  'assembly-manager': lazy(() => import('./plugins/AssemblyManager.jsx')),
+  'product-template-manager': lazy(() => import('./plugins/ProductTemplateManager.jsx')),
+  'component-manager': lazy(() => import('./plugins/ComponentManager.jsx')),
+  'number-generator': lazy(() => import('./plugins/NumberGenerator.jsx')),
+  'fla-calc': lazy(() => import('./plugins/FlaCalculator.jsx')),
+  'margin-calc': lazy(() => import('./plugins/MarginCalculator.jsx')),
+  'bom-importer': lazy(() => import('./plugins/LegacyBomImporter.jsx')),
+  'manual-bom-builder': lazy(() => import('./plugins/ManualBomBuilder.jsx')),
+  'settings': lazy(() => import('./Settings.jsx')),
+};
 
 /**
  * PluginRenderer component
- * Renders plugin HTML content in an isolated iframe with sandbox restrictions
+ * Renders plugin components directly using React.lazy and Suspense
+ * Plugins now share the same React, Tailwind, and shadcn context as the main app
  */
-const PluginRenderer = ({ pluginId, htmlContent }) => {
-  const iframeRef = useRef(null);
-
-  useEffect(() => {
-    if (iframeRef.current && htmlContent) {
-      const iframe = iframeRef.current;
-      const iframeDoc = iframe.contentDocument || iframe.contentWindow.document;
-      
-      iframeDoc.open();
-      iframeDoc.write(htmlContent);
-      iframeDoc.close();
-
-      // Inject shared fonts and plugin css
-      const head = iframeDoc.head || iframeDoc.getElementsByTagName('head')[0];
-      if (head) {
-        try {
-          const preconnect1 = iframeDoc.createElement('link');
-          preconnect1.rel = 'preconnect';
-          preconnect1.href = 'https://fonts.googleapis.com';
-          head.appendChild(preconnect1);
-
-          const preconnect2 = iframeDoc.createElement('link');
-          preconnect2.rel = 'preconnect';
-          preconnect2.href = 'https://fonts.gstatic.com';
-          preconnect2.crossOrigin = 'anonymous';
-          head.appendChild(preconnect2);
-
-          const fontsLink = iframeDoc.createElement('link');
-          fontsLink.rel = 'stylesheet';
-          fontsLink.href = 'https://fonts.googleapis.com/css2?family=Bungee&family=Poppins:wght@400;500;600;700&display=swap';
-          head.appendChild(fontsLink);
-
-          const styleEl = iframeDoc.createElement('style');
-          styleEl.type = 'text/css';
-          styleEl.appendChild(iframeDoc.createTextNode(pluginCss));
-          head.appendChild(styleEl);
-        } catch (e) {
-          // Non-fatal if fonts/styles fail to inject
-          // eslint-disable-next-line no-console
-          console.warn('Plugin style injection failed:', e);
-        }
-      }
-    }
-  }, [htmlContent]);
+const PluginRenderer = ({ pluginId, pluginContext, onNavigate }) => {
+  const PluginComponent = pluginMap[pluginId];
+  
+  if (!PluginComponent) {
+    return (
+      <div className="p-8 text-center">
+        <div className="bg-red-900 text-red-200 p-4 rounded-lg">
+          <p className="font-semibold">Error: Plugin '{pluginId}' not found.</p>
+          <p className="text-sm mt-2">Available plugins: {Object.keys(pluginMap).join(', ')}</p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="w-full h-full">
-      <iframe
-        ref={iframeRef}
-        title={pluginId}
-        sandbox="allow-scripts allow-same-origin allow-forms"
-        style={{
-          width: '100%',
-          height: '100%',
-          border: 'none',
-          minHeight: '600px'
-        }}
-      />
+      <Suspense fallback={
+        <div className="flex items-center justify-center h-screen">
+          <div className="text-center">
+            <div className="inline-block animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500"></div>
+            <p className="mt-4 text-gray-400">Loading plugin...</p>
+          </div>
+        </div>
+      }>
+        <PluginComponent context={pluginContext} onNavigate={onNavigate} />
+      </Suspense>
     </div>
   );
 };

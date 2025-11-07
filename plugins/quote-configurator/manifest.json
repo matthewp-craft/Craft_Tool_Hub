@@ -1,0 +1,10 @@
+{
+  "id": "quote-new",
+  "name": "Start New Quote",
+  "version": "1.0.0",
+  "description": "Jump directly into the configurator for a new quote.",
+  "author": "Craft Automation",
+  "entry": "index.html",
+  "icon": "Plus",
+  "category": "Quote Tools"
+}

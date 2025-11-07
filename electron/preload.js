@@ -39,9 +39,123 @@ contextBridge.exposeInMainWorld('plugins', {
   getHTML: (pluginId) => ipcRenderer.invoke('plugins:getHTML', pluginId),
 })
 
-// Expose Node.js process information
-contextBridge.exposeInMainWorld('versions', {
-  node: () => process.versions.node,
-  chrome: () => process.versions.chrome,
-  electron: () => process.versions.electron,
+// Expose components API
+contextBridge.exposeInMainWorld('components', {
+  getAll: () => ipcRenderer.invoke('components:getAll'),
+  search: (filters) => ipcRenderer.invoke('components:search', filters),
+  getBySku: (sku) => ipcRenderer.invoke('components:getBySku', sku),
+  getCategories: () => ipcRenderer.invoke('components:getCategories'),
+  getVendors: () => ipcRenderer.invoke('components:getVendors'),
+  syncFromCsv: (csvContent) => ipcRenderer.invoke('components:sync-from-csv', csvContent)
+})
+
+// Expose assemblies API
+contextBridge.exposeInMainWorld('assemblies', {
+  getAll: () => ipcRenderer.invoke('assemblies:getAll'),
+  save: (assemblyObj) => ipcRenderer.invoke('assemblies:save', assemblyObj),
+  delete: (assemblyId) => ipcRenderer.invoke('assemblies:delete', assemblyId),
+  search: (filters) => ipcRenderer.invoke('assemblies:search', filters),
+  getById: (assemblyId) => ipcRenderer.invoke('assemblies:getById', assemblyId),
+  expand: (assemblyId) => ipcRenderer.invoke('assemblies:expand', assemblyId),
+  getCategories: () => ipcRenderer.invoke('assemblies:getCategories'),
+})
+
+// Expose quotes API
+contextBridge.exposeInMainWorld('quotes', {
+  save: (quoteObj) => ipcRenderer.invoke('quote:save', quoteObj),
+  getAll: () => ipcRenderer.invoke('quote:get-all'),
+  getById: (id) => ipcRenderer.invoke('quote:get-by-id', id),
+  delete: (id) => ipcRenderer.invoke('quote:delete', id),
+})
+
+// Expose schemas API
+contextBridge.exposeInMainWorld('schemas', {
+  getIndustry: () => ipcRenderer.invoke('schemas:get-industry'),
+  getProduct: () => ipcRenderer.invoke('schemas:get-product'),
+  getControl: () => ipcRenderer.invoke('schemas:get-control'),
+  getScope: () => ipcRenderer.invoke('schemas:get-scope'),
+  getPanelOptions: () => ipcRenderer.invoke('schemas:get-panel-options'),
+  getDefaultIoFields: () => ipcRenderer.invoke('schemas:get-default-io-fields')
+})
+
+// Expose customers API
+contextBridge.exposeInMainWorld('customers', {
+  getAll: () => ipcRenderer.invoke('customers:get-all')
+})
+
+// Expose calculator API
+contextBridge.exposeInMainWorld('calc', {
+  getQuoteNumber: (data) => ipcRenderer.invoke('calc:get-quote-number', data),
+  getProjectNumber: (data) => ipcRenderer.invoke('calc:get-project-number', data)
+})
+
+// Expose product templates API
+contextBridge.exposeInMainWorld('productTemplates', {
+  get: (productCode) => ipcRenderer.invoke('product-templates:get', productCode),
+  save: (template) => ipcRenderer.invoke('product-templates:save', template),
+})
+
+// Expose manual BOMs API
+contextBridge.exposeInMainWorld('boms', {
+  getAll: () => ipcRenderer.invoke('boms:get-all'),
+  getById: (bomId) => ipcRenderer.invoke('boms:get-by-id', bomId),
+  save: (bomObj) => ipcRenderer.invoke('boms:save', bomObj),
+  expand: (bomData) => ipcRenderer.invoke('boms:expand-bom', bomData)
+})
+
+// Expose app API for file I/O
+contextBridge.exposeInMainWorld('app', {
+  showOpenDialog: (options) => ipcRenderer.invoke('app:show-open-dialog', options),
+  readFile: (filePath) => ipcRenderer.invoke('app:read-file', filePath),
+  writeFile: (filePath, content) => ipcRenderer.invoke('app:write-file', filePath, content)
+})
+
+// Expose pipedrive API
+contextBridge.exposeInMainWorld('pipedrive', {
+  getDeals: () => ipcRenderer.invoke('pipedrive:get-deals')
+})
+
+// Expose shell API for opening external links
+contextBridge.exposeInMainWorld('electron', {
+  shell: {
+    openExternal: (url) => ipcRenderer.invoke('shell:open-external', url)
+  },
+  on: (event, callback) => {
+    ipcRenderer.on(event, callback);
+  }
+})
+
+// Expose dashboard API
+contextBridge.exposeInMainWorld('api', {
+  getRecentQuotes: () => ipcRenderer.invoke('api:get-recent-quotes'),
+  getUsefulLinks: () => ipcRenderer.invoke('api:get-useful-links'),
+  getDocHubItems: () => ipcRenderer.invoke('api:get-doc-hub-items'),
+  getPluginRegistry: () => ipcRenderer.invoke('api:get-plugin-registry'),
+  openExternal: (url) => ipcRenderer.invoke('shell:open-external', url),
+  getDashboardSettings: () => ipcRenderer.invoke('api:get-dashboard-settings'),
+  saveDashboardSettings: (settings) => ipcRenderer.invoke('api:save-dashboard-settings', settings),
+  saveUsefulLinks: (links) => ipcRenderer.invoke('api:save-useful-links', links),
+  saveDocHubItems: (docs) => ipcRenderer.invoke('api:save-doc-hub-items', docs),
+  // Global Component Search
+  onOpenComponentSearch: (callback) => {
+    ipcRenderer.on('open-component-search', () => callback());
+  },
+  removeOpenComponentSearchListener: () => {
+    ipcRenderer.removeAllListeners('open-component-search');
+  }
+})
+
+// Expose BOM Importer API
+contextBridge.exposeInMainWorld('bomImporter', {
+  getCsvHeaders: (csvContent) => ipcRenderer.invoke('bom-importer:get-csv-headers', csvContent),
+  processImport: (data) => ipcRenderer.invoke('bom-importer:process-import', data)
+})
+
+// Expose Manual Management API
+contextBridge.exposeInMainWorld('manuals', {
+  checkLocal: (component) => ipcRenderer.invoke('manuals:check-local', component),
+  openLocal: (filePath) => ipcRenderer.invoke('manuals:open-local', filePath),
+  smartSearch: (component) => ipcRenderer.invoke('manuals:smart-search', component),
+  saveReference: (data) => ipcRenderer.invoke('manuals:save-reference', data),
+  getIndex: () => ipcRenderer.invoke('manuals:get-index')
 })

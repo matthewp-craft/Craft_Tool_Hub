@@ -1,0 +1,10 @@
+{
+  "id": "assembly-manager",
+  "name": "Assembly Manager",
+  "version": "1.0.0",
+  "description": "Build, edit, and manage reusable assembly 'kits'.",
+  "author": "Craft Automation",
+  "entry": "index.html",
+  "icon": "Package",
+  "category": "Assembly Tools"
+}

@@ -1,0 +1,10 @@
+{
+  "id": "product-templates",
+  "name": "Product Template Manager",
+  "version": "1.0.0",
+  "description": "Define the logic and forms for product types.",
+  "author": "Craft Automation",
+  "entry": "index.html",
+  "icon": "PackagePlus",
+  "category": "Template Tools"
+}

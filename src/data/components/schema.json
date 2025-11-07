@@ -1,0 +1,74 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Component",
+  "description": "A single component from the master catalog. Includes pricing from Smartsheet and custom engineering data.",
+  "type": "object",
+  "properties": {
+    "sku": {
+      "description": "Manufacturer part number (Smartsheet-owned)",
+      "type": "string"
+    },
+    "description": {
+      "description": "Part description and details (Smartsheet-owned)",
+      "type": "string"
+    },
+    "category": {
+      "description": "Sub category (Smartsheet-owned)",
+      "type": "string"
+    },
+    "price": {
+      "description": "Component cost (Smartsheet-owned)",
+      "type": "number",
+      "minimum": 0
+    },
+    "vendor": {
+      "description": "Vendor code (Smartsheet-owned)",
+      "type": "string"
+    },
+    "uom": {
+      "description": "Unit of measure / quantity (Smartsheet-owned)",
+      "type": "string"
+    },
+    "vndrnum": {
+      "description": "Vendor part code (Smartsheet-owned)",
+      "type": "string"
+    },
+    "notes": {
+      "description": "General notes (Smartsheet-owned)",
+      "type": "string"
+    },
+    "partAbbrev": {
+      "description": "Part abbreviation (Smartsheet-owned)",
+      "type": "string"
+    },
+    "lastPriceUpdate": {
+      "description": "Last price update date (Smartsheet-owned)",
+      "type": "string"
+    },
+    "volt": {
+      "description": "Voltage rating (Engineering-owned, protected from sync)",
+      "type": ["string", "null"]
+    },
+    "phase": {
+      "description": "Phase (1 or 3) (Engineering-owned, protected from sync)",
+      "type": ["string", "null"]
+    },
+    "amps": {
+      "description": "Amperage rating (Engineering-owned, protected from sync)",
+      "type": ["string", "null"]
+    },
+    "tags": {
+      "description": "Custom tags for filtering (Engineering-owned, protected from sync)",
+      "type": ["array", "null"],
+      "items": {
+        "type": "string"
+      }
+    },
+    "manualLink": {
+      "description": "URL to manual or spec sheet (Engineering-owned, protected from sync)",
+      "type": ["string", "null"],
+      "format": "uri"
+    }
+  },
+  "required": ["sku", "description", "category", "price", "vendor"]
+}

@@ -1,0 +1,10 @@
+{
+  "id": "bom-builder",
+  "name": "BOM Builder",
+  "version": "1.0.0",
+  "description": "Build and manage Bills of Materials with component integration, cost calculation, and quote export",
+  "author": "Craft Automation",
+  "entry": "index.html",
+  "icon": "📋",
+  "category": "Design Tools"
+}
