@@ -1,14 +1,499 @@
-import { app, BrowserWindow, ipcMain, dialog, Menu } from 'electron'
+import { app, BrowserWindow, ipcMain, dialog, Menu, shell } from 'electron'
 import path from 'path'
-import { fileURLToPath } from 'url'
+import { fileURLToPath, pathToFileURL } from 'url'
 import fs from 'fs/promises'
 import fssync from 'fs'
+import os from 'os'
 import Ajv from 'ajv'
 import Papa from 'papaparse'
-import crypto from 'crypto'
+
+// Server imports for embedded server
+import express from 'express'
+import cors from 'cors'
+import sqlite3 from 'sqlite3'
+import { open } from 'sqlite'
+
+// Sync Manager
+import SyncManager from './sync-manager.js'
+
+// Note: Services are imported dynamically in IPC handlers to handle ES module resolution
+// This avoids import errors in development mode when Electron may not resolve paths correctly
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
+
+// Initialize runtime configuration
+let runtimeConfigLoaded = false;
+let packagedRuntimeRoot = null;
+let networkCredentials = null; // Store network credentials in memory
+
+async function loadRuntimeConfig() {
+  try {
+    // Try to load runtime config from the packaged app directory
+    const configPath = path.join(process.resourcesPath, 'runtime-config.json');
+    const configData = await fs.readFile(configPath, 'utf-8');
+    const config = JSON.parse(configData);
+    console.log('Loaded runtime config:', config);
+    return config.runtimeRoot || null;
+  } catch (err) {
+    console.log('No runtime config found or error loading:', err.message);
+    return null;
+  }
+}
+
+async function initializeRuntimeConfig() {
+  if (!runtimeConfigLoaded) {
+    packagedRuntimeRoot = await loadRuntimeConfig();
+    runtimeConfigLoaded = true;
+  }
+  return packagedRuntimeRoot;
+}
+
+// Load network credentials from Windows Credential Manager
+async function loadNetworkCredentials() {
+  try {
+    const { execSync } = await import('child_process');
+    const output = execSync('cmdkey /list:target:"CraftAuto-Sales"', { encoding: 'utf8' });
+    const lines = output.split('\n');
+    const targetLine = lines.find(line => line.includes('Target: CraftAuto-Sales'));
+    if (targetLine) {
+      // Credentials exist, try to extract username
+      const userMatch = output.match(/User: ([^\r\n]+)/);
+      if (userMatch) {
+        return { username: userMatch[1].trim() };
+      }
+    }
+  } catch (err) {
+    // Credentials don't exist or cmdkey failed
+    console.log('No stored network credentials found');
+  }
+  return null;
+}
+
+// Save network credentials to Windows Credential Manager
+async function saveNetworkCredentials(username, password) {
+  try {
+    const { execSync } = await import('child_process');
+    // Delete existing credentials first
+    try {
+      execSync('cmdkey /delete:CraftAuto-Sales', { stdio: 'ignore' });
+    } catch (e) {
+      // Ignore if no existing credentials
+    }
+    // Add new credentials
+    execSync(`cmdkey /add:CraftAuto-Sales /user:${username} /pass:${password}`);
+    console.log('Network credentials saved to Windows Credential Manager');
+    return true;
+  } catch (err) {
+    console.error('Failed to save network credentials:', err);
+    return false;
+  }
+}
+
+// Test network connection with credentials
+async function testNetworkConnection(username, password) {
+  try {
+    const { execSync } = await import('child_process');
+    // Temporarily map the drive to test credentials
+    execSync(`net use Z: "\\\\192.168.1.99\\CraftAuto-Sales" /user:${username} /pass:${password} /persistent:no`, { timeout: 10000 });
+    // If successful, unmap the test drive
+    try {
+      execSync('net use Z: /delete /y');
+    } catch (e) {
+      // Ignore unmap errors
+    }
+    return true;
+  } catch (err) {
+    console.error('Network connection test failed:', err.message);
+    return false;
+  }
+}
+
+// Prompt user for network credentials
+async function promptForNetworkCredentials(mainWindow) {
+  return new Promise((resolve) => {
+    // Create a modal dialog for credential input
+    const credentialDialog = new BrowserWindow({
+      parent: mainWindow,
+      modal: true,
+      show: false,
+      width: 400,
+      height: 300,
+      resizable: false,
+      minimizable: false,
+      maximizable: false,
+      webPreferences: {
+        nodeIntegration: false,
+        contextIsolation: true,
+        preload: mainWindow.webContents.getURL().includes('http') ? null : path.join(__dirname, 'preload.cjs')
+      }
+    });
+
+    // Create HTML for credential input
+    const credentialHTML = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <style>
+          body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 20px; background: #f5f5f5; }
+          .container { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+          h2 { margin-top: 0; color: #333; }
+          .form-group { margin-bottom: 15px; }
+          label { display: block; margin-bottom: 5px; font-weight: 500; }
+          input { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
+          .buttons { display: flex; gap: 10px; margin-top: 20px; }
+          button { padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; }
+          .btn-primary { background: #007bff; color: white; }
+          .btn-secondary { background: #6c757d; color: white; }
+          .error { color: #dc3545; font-size: 14px; margin-top: 10px; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <h2>Network Access Required</h2>
+          <p>The application needs access to the network storage. Please enter your network credentials:</p>
+          <div class="form-group">
+            <label for="username">Username:</label>
+            <input type="text" id="username" placeholder="domain\\username or username">
+          </div>
+          <div class="form-group">
+            <label for="password">Password:</label>
+            <input type="password" id="password">
+          </div>
+          <div id="error" class="error" style="display: none;"></div>
+          <div class="buttons">
+            <button id="cancel" class="btn-secondary">Use Local Storage</button>
+            <button id="save" class="btn-primary">Connect</button>
+          </div>
+        </div>
+        <script>
+          // eslint-disable-next-line no-undef
+          const { ipcRenderer } = require('electron');
+
+          document.getElementById('save').addEventListener('click', async () => {
+            const username = document.getElementById('username').value.trim();
+            const password = document.getElementById('password').value;
+
+            if (!username || !password) {
+              document.getElementById('error').textContent = 'Please enter both username and password';
+              document.getElementById('error').style.display = 'block';
+              return;
+            }
+
+            document.getElementById('error').style.display = 'none';
+            document.getElementById('save').disabled = true;
+            document.getElementById('save').textContent = 'Testing...';
+
+            try {
+              const result = await ipcRenderer.invoke('network:test-credentials', { username, password });
+              if (result.success) {
+                ipcRenderer.send('credentials:save', { username, password });
+                window.close();
+              } else {
+                document.getElementById('error').textContent = result.error || 'Connection failed. Please check your credentials.';
+                document.getElementById('error').style.display = 'block';
+                document.getElementById('save').disabled = false;
+                document.getElementById('save').textContent = 'Connect';
+              }
+            } catch (error) {
+              document.getElementById('error').textContent = 'Connection test failed: ' + error.message;
+              document.getElementById('error').style.display = 'block';
+              document.getElementById('save').disabled = false;
+              document.getElementById('save').textContent = 'Connect';
+            }
+          });
+
+          document.getElementById('cancel').addEventListener('click', () => {
+            ipcRenderer.send('credentials:cancel');
+            window.close();
+          });
+
+          // Load stored credentials if available
+          ipcRenderer.invoke('network:get-stored-credentials').then(creds => {
+            if (creds && creds.username) {
+              document.getElementById('username').value = creds.username;
+            }
+          });
+        </script>
+      </body>
+      </html>
+    `;
+
+    credentialDialog.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(credentialHTML));
+
+    credentialDialog.once('ready-to-show', () => {
+      credentialDialog.show();
+    });
+
+    // Handle credential save
+    const saveHandler = (event, creds) => {
+      networkCredentials = creds;
+      resolve(creds);
+    };
+
+    // Handle cancel
+    const cancelHandler = () => {
+      resolve(null);
+    };
+
+    ipcMain.once('credentials:save', saveHandler);
+    ipcMain.once('credentials:cancel', cancelHandler);
+
+    credentialDialog.on('closed', () => {
+      ipcMain.removeListener('credentials:save', saveHandler);
+      ipcMain.removeListener('credentials:cancel', cancelHandler);
+      resolve(null);
+    });
+  });
+}
+
+const ENV_RUNTIME_ROOT = [
+  process.env.CTH_RUNTIME_ROOT,
+  process.env.CRAFT_TOOLS_RUNTIME_ROOT,
+  process.env.CRAFT_TOOLS_NAS_ROOT
+].find(value => typeof value === 'string' && value.trim().length > 0)
+
+const resolvedRuntimeRoot = ENV_RUNTIME_ROOT
+  ? path.resolve(ENV_RUNTIME_ROOT.trim())
+  : null
+
+const defaultRuntimeRoot = path.resolve(app.getPath('userData'), 'data')
+
+async function resolveRuntimePath(targetPath = '') {
+  if (!targetPath) {
+    // For root path, try network first, then fallback to local
+    if (resolvedRuntimeRoot) {
+      // In packaged apps, synchronous access checks may fail for network paths
+      // even when the paths are accessible. Trust the environment variable.
+      return resolvedRuntimeRoot;
+    }
+
+    // Check packaged config as fallback
+    const configRoot = await initializeRuntimeConfig();
+    if (configRoot) {
+      return configRoot;
+    }
+
+    return defaultRuntimeRoot;
+  }
+
+  if (path.isAbsolute(targetPath)) {
+    return targetPath;
+  }
+
+  // For relative paths, try network first, then fallback to local
+  let base = defaultRuntimeRoot; // Default to local
+
+  if (resolvedRuntimeRoot) {
+    // In packaged apps, synchronous access checks may fail for network paths
+    // even when the paths are accessible. Trust the environment variable.
+    base = resolvedRuntimeRoot;
+  } else {
+    // Check packaged config as fallback
+    const configRoot = await initializeRuntimeConfig();
+    if (configRoot) {
+      base = configRoot;
+    }
+  }
+
+  return path.resolve(base, targetPath);
+}
+
+// Enhanced runtime path resolution with credential prompting
+async function resolveRuntimePathWithCredentials(targetPath = '', mainWindow = null) {
+  if (!targetPath) {
+    // For root path, try network first, then fallback to local
+    if (resolvedRuntimeRoot) {
+      // Test network access
+      try {
+        await fs.access(resolvedRuntimeRoot);
+        return resolvedRuntimeRoot;
+      } catch (err) {
+        console.log('Network path not accessible:', err.message);
+        // Try to load stored credentials and test connection
+        if (!networkCredentials) {
+          networkCredentials = await loadNetworkCredentials();
+        }
+
+        if (networkCredentials && mainWindow) {
+          // Test if stored credentials work
+          const testResult = await testNetworkConnection(networkCredentials.username, ''); // Password not stored in memory
+          if (!testResult) {
+            // Stored credentials don't work, prompt user
+            const newCreds = await promptForNetworkCredentials(mainWindow);
+            if (newCreds) {
+              networkCredentials = newCreds;
+              // Test the new credentials
+              const newTestResult = await testNetworkConnection(newCreds.username, newCreds.password);
+              if (newTestResult) {
+                // Save credentials and try network again
+                await saveNetworkCredentials(newCreds.username, newCreds.password);
+                try {
+                  await fs.access(resolvedRuntimeRoot);
+                  return resolvedRuntimeRoot;
+                } catch (e) {
+                  console.log('Network still not accessible after credential update');
+                }
+              }
+            }
+          } else {
+            // Stored credentials work
+            try {
+              await fs.access(resolvedRuntimeRoot);
+              return resolvedRuntimeRoot;
+            } catch (e) {
+              console.log('Network not accessible despite valid credentials');
+            }
+          }
+        }
+        // Fall back to local
+        return defaultRuntimeRoot;
+      }
+    }
+
+    // Check packaged config as fallback
+    const configRoot = await initializeRuntimeConfig();
+    if (configRoot) {
+      return configRoot;
+    }
+
+    return defaultRuntimeRoot;
+  }
+
+  if (path.isAbsolute(targetPath)) {
+    return targetPath;
+  }
+
+  // For relative paths, try network first, then fallback to local
+  let base = defaultRuntimeRoot; // Default to local
+
+  if (resolvedRuntimeRoot) {
+    // Test network access for relative paths too
+    try {
+      await fs.access(resolvedRuntimeRoot);
+      base = resolvedRuntimeRoot;
+    } catch (err) {
+      console.log('Network path not accessible for relative path:', err.message);
+      // Try credential prompting here too if we have a main window
+      if (mainWindow && !networkCredentials) {
+        networkCredentials = await loadNetworkCredentials();
+      }
+
+      if (networkCredentials && mainWindow) {
+        const testResult = await testNetworkConnection(networkCredentials.username, '');
+        if (!testResult) {
+          const newCreds = await promptForNetworkCredentials(mainWindow);
+          if (newCreds) {
+            networkCredentials = newCreds;
+            const newTestResult = await testNetworkConnection(newCreds.username, newCreds.password);
+            if (newTestResult) {
+              await saveNetworkCredentials(newCreds.username, newCreds.password);
+              try {
+                await fs.access(resolvedRuntimeRoot);
+                base = resolvedRuntimeRoot;
+              } catch (e) {
+                console.log('Network still not accessible after credential update');
+              }
+            }
+          }
+        } else {
+          try {
+            await fs.access(resolvedRuntimeRoot);
+            base = resolvedRuntimeRoot;
+          } catch (e) {
+            console.log('Network not accessible despite valid credentials');
+          }
+        }
+      }
+    }
+  } else {
+    // Check packaged config as fallback
+    const configRoot = await initializeRuntimeConfig();
+    if (configRoot) {
+      base = configRoot;
+    }
+  }
+
+  return path.resolve(base, targetPath);
+}
+
+async function ensureDirectoryForFile(targetPath) {
+  const directory = path.dirname(targetPath)
+  await fs.mkdir(directory, { recursive: true })
+}
+
+async function getRuntimeStatus() {
+  const runtimeRoot = await resolveRuntimePath()
+  const usingOverride = Boolean(resolvedRuntimeRoot) || Boolean(await initializeRuntimeConfig())
+  const status = {
+    runtimeRoot,
+    usingOverride,
+    ok: true,
+    message: usingOverride ? 'Runtime override active.' : 'Using local runtime.',
+    buildInfo: null,
+    buildInfoFileModified: null,
+    buildInfoAgeMinutes: null
+  }
+
+  try {
+    await fs.access(runtimeRoot)
+  } catch (err) {
+    status.ok = !usingOverride
+    status.message = usingOverride
+      ? 'Runtime override unavailable: ' + err.message
+      : 'Local runtime unavailable: ' + err.message
+    status.error = err.message
+    return status
+  }
+
+  const buildInfoPath = path.join(runtimeRoot, 'build-info.json')
+
+  try {
+    const content = await fs.readFile(buildInfoPath, 'utf-8')
+    const info = JSON.parse(content)
+    status.buildInfo = info
+
+    const stats = await fs.stat(buildInfoPath)
+    status.buildInfoFileModified = stats.mtime.toISOString()
+
+    if (info?.timestampUtc) {
+      const parsed = Date.parse(info.timestampUtc)
+      if (!Number.isNaN(parsed)) {
+        status.buildInfoAgeMinutes = Math.round((Date.now() - parsed) / 60000)
+      }
+    }
+
+    if (usingOverride) {
+      const version = info?.version || 'unknown version'
+      const timestamp = info?.timestampUtc || status.buildInfoFileModified
+      status.message = 'NAS build ' + version + ' @ ' + timestamp
+    } else {
+      status.message = 'Using local runtime'
+    }
+  } catch (err) {
+    if (usingOverride) {
+      status.ok = false
+      status.message = err.code === 'ENOENT'
+        ? 'NAS build-info.json not found'
+        : 'NAS runtime error: ' + err.message
+      status.error = err.message
+    } else {
+      status.message = 'Using local runtime'
+    }
+  }
+
+  return status
+}
+
+if (resolvedRuntimeRoot) {
+  fs.mkdir(resolvedRuntimeRoot, { recursive: true })
+    .then(() => {
+      console.log('Craft Tools Hub runtime root override active:', resolvedRuntimeRoot)
+    })
+    .catch(err => {
+      console.error('Failed to prepare runtime root override:', err)
+    })
+}
 
 // Determine if running in development mode
 const isDev = !app.isPackaged
@@ -19,10 +504,20 @@ let dataPath
 let pluginsPath
 let loadedPlugins = []
 let loadedComponents = []
-let loadedAssemblies = []
-let cachedAllAssemblies = [] // New: Cache for all assemblies
+let loadedSubAssemblies = []
+let cachedSubAssemblies = [] // Cache for all sub-assemblies
 let quoteSchema
 let quoteValidate
+
+// Embedded server variables
+let serverApp
+let serverDb
+let generatedNumbersDb
+let serverPort = 3001
+let serverInstance
+
+// Sync Manager instance
+let syncManager = null
 
 // Default customer data (same as in App.jsx)
 const DEFAULT_CUSTOMER_DATA = {
@@ -214,7 +709,7 @@ const DEFAULT_CUSTOMER_DATA = {
 
 // Initialize data storage
 async function initDataStorage() {
-  dataPath = path.join(app.getPath('userData'), 'data')
+  dataPath = path.join(defaultRuntimeRoot)
   try {
     await fs.mkdir(dataPath, { recursive: true })
     console.log('Data directory created:', dataPath)
@@ -240,6 +735,604 @@ async function initPluginsDirectory() {
   }
 }
 
+// Initialize database tables
+async function initializeDatabaseTables(db) {
+  try {
+    console.log('Initializing database tables...')
+
+    // Components table (already exists, but ensure it has all columns)
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS components (
+        sku TEXT PRIMARY KEY,
+        description TEXT,
+        category TEXT,
+        vendor TEXT,
+        price REAL,
+        volt INTEGER,
+        phase INTEGER,
+        amps REAL,
+        tags TEXT,
+        manualLink TEXT,
+        uom TEXT,
+        vndrnum TEXT,
+        notes TEXT,
+        partAbbrev TEXT,
+        lastPriceUpdate TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `)
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS customers (
+        customerCode TEXT PRIMARY KEY,
+        customerName TEXT NOT NULL,
+        isActive BOOLEAN DEFAULT 1,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `)
+
+    // Sub-assemblies table
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS sub_assemblies (
+        subAssemblyId TEXT PRIMARY KEY,
+        description TEXT NOT NULL,
+        category TEXT,
+        attributes TEXT, -- JSON string for complex attributes
+        components TEXT, -- JSON string for component list
+        estimatedLaborHours REAL,
+        isBundled BOOLEAN DEFAULT 0,
+        isUserCreated BOOLEAN DEFAULT 1,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `)
+
+    // Quotes table
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS quotes (
+        quoteId TEXT PRIMARY KEY,
+        projectName TEXT,
+        customer TEXT,
+        salesRep TEXT,
+        status TEXT DEFAULT 'draft',
+        projectCodes TEXT, -- JSON string for project codes
+        controlPanelConfig TEXT, -- JSON string for panel config
+        operationalItems TEXT, -- JSON string for operational items
+        pricing TEXT, -- JSON string for pricing data
+        bom TEXT, -- JSON string for BOM data
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `)
+
+    // Operational items table (for detailed BOM items)
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS operational_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        quoteId TEXT,
+        sku TEXT,
+        description TEXT,
+        displayName TEXT,
+        quantity REAL,
+        unitPrice REAL,
+        totalPrice REAL,
+        vendor TEXT,
+        vndrnum TEXT,
+        category TEXT,
+        sectionGroup TEXT,
+        sourceAssembly TEXT,
+        sourceRule TEXT,
+        notes TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (quoteId) REFERENCES quotes (quoteId) ON DELETE CASCADE
+      )
+    `)
+
+    // Product templates table
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS product_templates (
+        productCode INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        description TEXT,
+        templateData TEXT, -- JSON string for template structure
+        isActive BOOLEAN DEFAULT 1,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `)
+
+    // Projects table (for project tracking)
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS projects (
+        id TEXT PRIMARY KEY,
+        projectNumber TEXT,
+        quoteNumber TEXT,
+        projectName TEXT,
+        customer TEXT,
+        industry TEXT,
+        product TEXT,
+        control TEXT,
+        scope TEXT,
+        poNumber TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `)
+
+    // Manual quotes table (for associating manual calculations with quote numbers)
+    console.log('Creating manual_quotes table...')
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS manual_quotes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        quoteNumber TEXT NOT NULL UNIQUE,
+        type TEXT NOT NULL, -- 'margin_calculation' or 'bom'
+        data TEXT NOT NULL, -- JSON string for the calculation or BOM data
+        projectName TEXT,
+        customer TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `)
+    console.log('manual_quotes table created successfully')
+
+    // Generated numbers table (for tracking quote and project number generation)
+    console.log('Creating generated_numbers table...')
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS generated_numbers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        type TEXT NOT NULL, -- 'quote' or 'project'
+        mainId TEXT NOT NULL,
+        fullId TEXT NOT NULL,
+        customerCode TEXT,
+        customerName TEXT,
+        industry TEXT,
+        product TEXT,
+        control TEXT,
+        scope TEXT,
+        poNumber TEXT,
+        generated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_by TEXT,
+        synced_at DATETIME
+      )
+    `)
+    console.log('generated_numbers table created successfully')
+
+    console.log('Database tables initialized successfully')
+
+    // Run data migration from JSON files to database
+    await migrateExistingData(db)
+  } catch (error) {
+    console.error('Error initializing database tables:', error)
+    throw error
+  }
+}
+
+// Migrate existing JSON data to database tables
+async function migrateExistingData(db) {
+  try {
+    console.log('Checking for existing data to migrate...')
+
+    // Migrate customers from hardcoded data
+    try {
+      console.log('Migrating customers from hardcoded data...')
+
+      for (const [customerCode, customerName] of Object.entries(DEFAULT_CUSTOMER_DATA)) {
+        const existing = await db.get('SELECT customerCode FROM customers WHERE customerCode = ?', [customerCode])
+        if (!existing) {
+          await db.run(`
+            INSERT INTO customers (
+              customerCode, customerName, isActive, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+          `, [
+            customerCode,
+            customerName,
+            1,
+            new Date().toISOString(),
+            new Date().toISOString()
+          ])
+        }
+      }
+      console.log('Customers migration completed')
+    } catch (error) {
+      console.log('Error migrating customers:', error.message)
+    }
+
+    // Migrate sub-assemblies
+    try {
+      const subAssembliesPath = path.join(dataPath, 'sub_assemblies.json')
+      const subAssembliesData = await fs.readFile(subAssembliesPath, 'utf-8')
+      const subAssemblies = JSON.parse(subAssembliesData)
+
+      if (Array.isArray(subAssemblies) && subAssemblies.length > 0) {
+        console.log(`Migrating ${subAssemblies.length} sub-assemblies to database...`)
+
+        for (const sa of subAssemblies) {
+          const existing = await db.get('SELECT subAssemblyId FROM sub_assemblies WHERE subAssemblyId = ?', [sa.subAssemblyId || sa.assemblyId])
+          if (!existing) {
+            await db.run(`
+              INSERT INTO sub_assemblies (
+                subAssemblyId, description, category, attributes, components,
+                estimatedLaborHours, isBundled, isUserCreated, created_at, updated_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `, [
+              sa.subAssemblyId || sa.assemblyId,
+              sa.description || '',
+              sa.category || '',
+              JSON.stringify(sa.attributes || {}),
+              JSON.stringify(sa.components || []),
+              sa.estimatedLaborHours || 0,
+              sa.isBundled ? 1 : 0,
+              sa.isUserCreated ? 1 : 0,
+              new Date().toISOString(),
+              new Date().toISOString()
+            ])
+          }
+        }
+        console.log('Sub-assemblies migration completed')
+      }
+    } catch (error) {
+      console.log('No sub-assemblies to migrate or migration failed:', error.message)
+    }
+
+    // Migrate quotes
+    try {
+      const quotesDir = path.join(dataPath, 'quotes')
+      const files = await fs.readdir(quotesDir)
+      const jsonFiles = files.filter(f => f.endsWith('.json'))
+
+      if (jsonFiles.length > 0) {
+        console.log(`Migrating ${jsonFiles.length} quotes to database...`)
+
+        for (const file of jsonFiles) {
+          const filePath = path.join(quotesDir, file)
+          const quoteData = await fs.readFile(filePath, 'utf-8')
+          const quote = JSON.parse(quoteData)
+
+          const existing = await db.get('SELECT quoteId FROM quotes WHERE quoteId = ?', [quote.quoteId])
+          if (!existing) {
+            await db.run(`
+              INSERT INTO quotes (
+                quoteId, projectName, customer, salesRep, status,
+                projectCodes, controlPanelConfig, operationalItems,
+                pricing, bom, created_at, updated_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `, [
+              quote.quoteId,
+              quote.projectName || '',
+              quote.customer || '',
+              quote.salesRep || '',
+              quote.status || 'draft',
+              JSON.stringify(quote.projectCodes || {}),
+              JSON.stringify(quote.controlPanelConfig || {}),
+              JSON.stringify(quote.operationalItems || []),
+              JSON.stringify(quote.pricing || {}),
+              JSON.stringify(quote.bom || null),
+              new Date().toISOString(),
+              new Date().toISOString()
+            ])
+
+            // Migrate operational items if they exist
+            if (Array.isArray(quote.operationalItems) && quote.operationalItems.length > 0) {
+              for (const item of quote.operationalItems) {
+                await db.run(`
+                  INSERT INTO operational_items (
+                    quoteId, sku, description, displayName, quantity, unitPrice, totalPrice,
+                    vendor, vndrnum, category, sectionGroup, sourceAssembly, sourceRule, notes
+                  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                `, [
+                  quote.quoteId,
+                  item.sku || '',
+                  item.description || '',
+                  item.displayName || '',
+                  item.quantity || 0,
+                  item.unitPrice || 0,
+                  item.totalPrice || 0,
+                  item.vendor || '',
+                  item.vndrnum || '',
+                  item.category || '',
+                  item.sectionGroup || '',
+                  item.sourceAssembly || '',
+                  item.sourceRule || '',
+                  item.notes || ''
+                ])
+              }
+            }
+          }
+        }
+        console.log('Quotes migration completed')
+      }
+    } catch (error) {
+      console.log('No quotes to migrate or migration failed:', error.message)
+    }
+
+    // Migrate projects
+    try {
+      const projectsPath = path.join(dataPath, 'projects.json')
+      const projectsData = await fs.readFile(projectsPath, 'utf-8')
+      const projects = JSON.parse(projectsData)
+
+      if (Array.isArray(projects) && projects.length > 0) {
+        console.log(`Migrating ${projects.length} projects to database...`)
+
+        for (const project of projects) {
+          const existing = await db.get('SELECT id FROM projects WHERE id = ?', [project.id])
+          if (!existing) {
+            await db.run(`
+              INSERT INTO projects (
+                id, projectNumber, quoteNumber, projectName, customer,
+                industry, product, control, scope, poNumber, created_at, updated_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `, [
+              project.id,
+              project.projectNumber || '',
+              project.quoteNumber || '',
+              project.projectName || '',
+              project.customer || '',
+              project.industry || '',
+              project.product || '',
+              project.control || '',
+              project.scope || '',
+              project.poNumber || '',
+              project.createdAt || new Date().toISOString(),
+              new Date().toISOString()
+            ])
+          }
+        }
+        console.log('Projects migration completed')
+      }
+    } catch (error) {
+      console.log('No projects to migrate or migration failed:', error.message)
+    }
+
+    // Migrate product templates
+    try {
+      const templatesDir = path.join(dataPath, 'product-templates')
+      const files = await fs.readdir(templatesDir)
+      const jsonFiles = files.filter(f => f.endsWith('.json'))
+
+      if (jsonFiles.length > 0) {
+        console.log(`Migrating ${jsonFiles.length} product templates to database...`)
+
+        for (const file of jsonFiles) {
+          const productCode = file.replace('.json', '')
+          const filePath = path.join(templatesDir, file)
+          const templateData = await fs.readFile(filePath, 'utf-8')
+          const template = JSON.parse(templateData)
+
+          const existing = await db.get('SELECT productCode FROM product_templates WHERE productCode = ?', [parseInt(productCode)])
+          if (!existing) {
+            await db.run(`
+              INSERT INTO product_templates (
+                productCode, name, description, templateData, isActive, created_at, updated_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            `, [
+              parseInt(productCode),
+              template.name || `Product ${productCode}`,
+              template.description || '',
+              JSON.stringify(template),
+              1,
+              new Date().toISOString(),
+              new Date().toISOString()
+            ])
+          }
+        }
+        console.log('Product templates migration completed')
+      }
+    } catch (error) {
+      console.log('No product templates to migrate or migration failed:', error.message)
+    }
+
+    console.log('Data migration completed successfully')
+  } catch (error) {
+    console.error('Error during data migration:', error)
+  }
+}
+
+// Initialize generated numbers database tables
+async function initializeGeneratedNumbersDatabase() {
+  try {
+    console.log('Initializing generated numbers database...')
+
+    // Database path for generated numbers - use NAS if available, fallback to local
+    const dbDir = await resolveRuntimePath('database')
+    const dbPath = path.join(dbDir, 'generated_numbers.db')
+
+    // Ensure database directory exists
+    await fs.mkdir(dbDir, { recursive: true })
+
+    // For ASAR-packed applications, sqlite3 binaries must be unpacked
+    const actualDbPath = app.isPackaged && dbPath.includes('app.asar')
+      ? dbPath.replace('app.asar', 'app.asar.unpacked')
+      : dbPath
+
+    console.log('Opening generated numbers database at:', actualDbPath)
+    console.log('Database location type:', resolvedRuntimeRoot ? 'NAS/Shared' : 'Local')
+
+    generatedNumbersDb = await open({
+      filename: actualDbPath,
+      driver: sqlite3.Database
+    })
+    console.log('Generated numbers database connected successfully')
+
+    // Create generated numbers table
+    console.log('Creating generated numbers table in separate database...')
+    await generatedNumbersDb.exec(`
+      CREATE TABLE IF NOT EXISTS generated_numbers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        type TEXT NOT NULL, -- 'quote' or 'project'
+        mainId TEXT NOT NULL,
+        fullId TEXT NOT NULL,
+        customerCode TEXT,
+        customerName TEXT,
+        industry TEXT,
+        product TEXT,
+        control TEXT,
+        scope TEXT,
+        poNumber TEXT,
+        generated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_by TEXT,
+        synced_at DATETIME
+      )
+    `)
+    console.log('Generated numbers table created in separate database successfully')
+
+    console.log('Generated numbers database initialized successfully')
+  } catch (error) {
+    console.error('❌ Error initializing generated numbers database:', error)
+    console.error('   Error code:', error.code)
+    console.error('   Error message:', error.message)
+    if (error.stack) console.error('   Stack:', error.stack)
+    // Don't throw error - allow app to continue without generated numbers database
+    generatedNumbersDb = null
+  }
+}
+
+/**
+ * Initialize the Sync Manager for multi-user database synchronization
+ */
+async function initializeSyncManager() {
+  try {
+    console.log('Initializing Sync Manager...')
+
+    // Get local database directory (user-specific)
+    const userDataPath = app.getPath('userData')
+    const localDbDir = path.join(userDataPath, 'database')
+    await fs.mkdir(localDbDir, { recursive: true })
+
+    // Local database paths
+    const localServerDbPath = path.join(localDbDir, 'server.db')
+    const localGeneratedNumbersDbPath = path.join(localDbDir, 'generated_numbers.db')
+
+    // NAS master database paths (if available)
+    let nasServerDbPath = null
+    let nasGeneratedNumbersDbPath = null
+    
+    // Check both environment variables and packaged config
+    const runtimeRoot = resolvedRuntimeRoot || await initializeRuntimeConfig()
+    if (runtimeRoot) {
+      const nasDbDir = await resolveRuntimePath('database')
+      nasServerDbPath = path.join(nasDbDir, 'server.db')
+      nasGeneratedNumbersDbPath = path.join(nasDbDir, 'generated_numbers.db')
+    }
+
+    // Create sync manager instance
+    syncManager = new SyncManager({
+      localServerDb: localServerDbPath,
+      localGeneratedNumbersDb: localGeneratedNumbersDbPath,
+      nasServerDb: nasServerDbPath,
+      nasGeneratedNumbersDb: nasGeneratedNumbersDbPath,
+      syncIntervalMinutes: 120, // Sync every 2 hours by default
+      username: os.userInfo().username
+    })
+
+    // Initialize the sync manager
+    await syncManager.initialize()
+
+    // Start scheduled synchronization
+    await syncManager.startScheduledSync()
+
+    console.log('✅ Sync Manager initialized successfully')
+    console.log(`   Local DB: ${localServerDbPath}`)
+    if (nasServerDbPath) {
+      console.log(`   NAS Master DB: ${nasServerDbPath}`)
+      console.log(`   Sync interval: 120 minutes`)
+    } else {
+      console.log('   NAS sync disabled (no shared network path configured)')
+    }
+  } catch (error) {
+    console.error('❌ Error initializing Sync Manager:', error)
+    console.error('   Error code:', error.code)
+    console.error('   Error message:', error.message)
+    if (error.stack) console.error('   Stack:', error.stack)
+    // Don't throw - allow app to continue without sync capability
+    syncManager = null
+    console.log('⚠️  App will continue without sync functionality')
+  }
+}
+
+// Initialize embedded API server
+async function initEmbeddedServer() {
+  try {
+    console.log('Starting embedded server initialization...')
+
+    serverApp = express()
+    serverApp.use(cors())
+    serverApp.use(express.json())
+
+    // Database path - try NAS first, fallback to local
+    const dbDir = await resolveRuntimePath('database')
+    const dbPath = path.join(dbDir, 'craft_tools.db')
+
+    // Ensure database directory exists
+    await fs.mkdir(dbDir, { recursive: true })
+
+    // For ASAR-packed applications, sqlite3 binaries must be unpacked
+    const actualDbPath = app.isPackaged && dbPath.includes('app.asar')
+      ? dbPath.replace('app.asar', 'app.asar.unpacked')
+      : dbPath
+
+    console.log('Opening main database at:', actualDbPath)
+    console.log('Database location type:', resolvedRuntimeRoot ? 'NAS/Shared' : 'Local')
+
+    serverDb = await open({
+      filename: actualDbPath,
+      driver: sqlite3.Database
+    })
+    console.log('Embedded server connected to database successfully')
+
+    // Initialize database tables
+    console.log('About to initialize database tables...')
+    await initializeDatabaseTables(serverDb)
+    console.log('Database tables initialization completed successfully')
+
+    // API Routes
+    serverApp.get('/api/health', (req, res) => {
+      res.json({
+        status: 'OK',
+        timestamp: new Date().toISOString(),
+        database: serverDb ? 'connected' : 'disconnected'
+      })
+    })
+
+    serverApp.get('/api/components', async (req, res) => {
+      try {
+        if (!serverDb) {
+          return res.status(500).json({ error: 'Database not connected' })
+        }
+        const components = await serverDb.all('SELECT * FROM components LIMIT 100')
+        res.json(components)
+      } catch (error) {
+        console.error('Error fetching components:', error)
+        res.status(500).json({ error: 'Failed to fetch components' })
+      }
+    })
+
+    serverApp.get('/api/components/count', async (req, res) => {
+      try {
+        if (!serverDb) {
+          return res.status(500).json({ error: 'Database not connected' })
+        }
+        const result = await serverDb.get('SELECT COUNT(*) as count FROM components')
+        res.json({ count: result.count })
+      } catch (error) {
+        console.error('Error getting component count:', error)
+        res.status(500).json({ error: 'Failed to get component count' })
+      }
+    })
+
+    // Start server
+    serverInstance = serverApp.listen(serverPort, () => {
+      console.log(`Embedded API server running on port ${serverPort}`)
+    })
+
+  } catch (error) {
+    console.error('Failed to initialize embedded server:', error)
+  }
+}
+
 // Discover and load all plugins
 async function loadPlugins() {
   try {
@@ -251,6 +1344,14 @@ async function loadPlugins() {
     for (const dir of pluginDirs) {
       try {
         const manifestPath = path.join(pluginsPath, dir.name, 'manifest.json')
+        // Skip directories that don't contain a manifest.json to avoid noisy ENOENT warnings
+        try {
+          await fs.access(manifestPath)
+        } catch {
+          console.log(`No manifest found for plugin directory: ${dir.name}, skipping.`)
+          continue
+        }
+
         const manifestData = await fs.readFile(manifestPath, 'utf-8')
         const manifest = JSON.parse(manifestData)
         
@@ -278,31 +1379,83 @@ async function loadPlugins() {
   }
 }
 
-// Load component catalog from bundled data
+function sanitizeComponentCatalog(list = []) {
+  if (!Array.isArray(list)) {
+    return []
+  }
+
+  let filteredOut = 0
+
+  const sanitized = list.reduce((acc, component) => {
+    if (!component || typeof component !== 'object') {
+      filteredOut += 1
+      return acc
+    }
+
+    const rawPrice = component.price
+    const numericPrice = typeof rawPrice === 'string'
+      ? Number(rawPrice.replace(/[$,]/g, ''))
+      : Number(rawPrice)
+
+    if (!Number.isFinite(numericPrice) || numericPrice <= 0) {
+      filteredOut += 1
+      return acc
+    }
+
+    acc.push({ ...component, price: numericPrice })
+    return acc
+  }, [])
+
+  if (filteredOut > 0) {
+    console.log(`Filtered ${filteredOut} components with no valid price`)
+  }
+
+  return sanitized
+}
+
+// Load component catalog from API server
 async function loadComponents() {
   try {
-    // First, try to load from synced data (user's uploaded CSV)
+    // Try to load from API server first
+    try {
+      console.log('Attempting to load components from API server...');
+      const response = await fetch('http://localhost:3001/api/components');
+      if (response.ok) {
+        const components = await response.json();
+        loadedComponents = sanitizeComponentCatalog(components);
+        console.log(`Loaded ${loadedComponents.length} components from API server`);
+        return loadedComponents;
+      } else {
+        console.log('API server responded with error:', response.status);
+      }
+    } catch (apiErr) {
+      console.log('API server not available, falling back to local data:', apiErr.message);
+    }
+
+    // Fallback to synced data (user's uploaded CSV)
     const syncedPath = path.join(dataPath, 'components', 'component_catalog.json');
-    
+
     try {
       const syncedData = await fs.readFile(syncedPath, 'utf-8');
-      loadedComponents = JSON.parse(syncedData);
+      const parsed = JSON.parse(syncedData);
+      loadedComponents = sanitizeComponentCatalog(parsed);
       console.log(`Loaded ${loadedComponents.length} components from synced catalog`);
       return loadedComponents;
     } catch (syncErr) {
       console.log('No synced catalog found, loading bundled catalog...');
     }
-    
-    // Fallback to bundled data
+
+    // Final fallback to bundled data
     let componentsPath;
     if (process.env.NODE_ENV === 'development' || !app.isPackaged) {
       componentsPath = path.join(__dirname, '..', 'src', 'data', 'components', 'component_catalog.json');
     } else {
-      componentsPath = path.join(process.resourcesPath, 'data', 'components', 'component_catalog.json');
+      componentsPath = path.join(process.resourcesPath, 'app.asar', 'src', 'data', 'components', 'component_catalog.json');
     }
-    
+
     const data = await fs.readFile(componentsPath, 'utf-8');
-    loadedComponents = JSON.parse(data);
+    const parsed = JSON.parse(data);
+    loadedComponents = sanitizeComponentCatalog(parsed);
     console.log(`Loaded ${loadedComponents.length} components from bundled catalog`);
     return loadedComponents;
   } catch (err) {
@@ -311,22 +1464,32 @@ async function loadComponents() {
   }
 }
 
-// Load assemblies from bundled data
-async function loadAssemblies() {
+// Load sub-assemblies from bundled data
+async function loadSubAssemblies() {
   try {
-    let assembliesPath
-    if (process.env.NODE_ENV === 'development' || !app.isPackaged) {
-      assembliesPath = path.join(__dirname, '..', 'src', 'data', 'assemblies', 'assemblies.json')
-    } else {
-      assembliesPath = path.join(process.resourcesPath, 'data', 'assemblies', 'assemblies.json')
+    // Check if bundled sub-assemblies should be disabled for production
+    const disableBundledSubAssemblies = process.env.DISABLE_BUNDLED_SUBASSEMBLIES === 'true' ||
+                                       process.env.NODE_ENV === 'production' && !process.env.FORCE_LOAD_BUNDLED_SUBASSEMBLIES;
+
+    if (disableBundledSubAssemblies) {
+      console.log('Bundled sub-assemblies disabled for production environment');
+      loadedSubAssemblies = [];
+      return loadedSubAssemblies;
     }
-    
-    const data = await fs.readFile(assembliesPath, 'utf-8')
-    loadedAssemblies = JSON.parse(data)
-    console.log(`Loaded ${loadedAssemblies.length} assemblies from library`)
-    return loadedAssemblies
+
+    let subAssembliesPath
+    if (process.env.NODE_ENV === 'development' || !app.isPackaged) {
+      subAssembliesPath = path.join(__dirname, '..', 'src', 'data', 'sub-assemblies', 'sub_assemblies.json')
+    } else {
+      subAssembliesPath = path.join(process.resourcesPath, 'app.asar', 'src', 'data', 'sub-assemblies', 'sub_assemblies.json')
+    }
+
+    const data = await fs.readFile(subAssembliesPath, 'utf-8')
+    loadedSubAssemblies = JSON.parse(data)
+    console.log(`Loaded ${loadedSubAssemblies.length} sub-assemblies from library`)
+    return loadedSubAssemblies
   } catch (err) {
-    console.error('Error loading assemblies:', err)
+    console.error('Error loading sub-assemblies:', err)
     return []
   }
 }
@@ -350,12 +1513,28 @@ async function writeJSONFile(filename, data) {
   await fs.writeFile(filePath, JSON.stringify(data, null, 2), 'utf-8')
 }
 
+function csvEscape(value) {
+  if (value === undefined || value === null) {
+    return ''
+  }
+
+  const stringValue = typeof value === 'string' ? value : String(value)
+  if (stringValue.includes('"') || stringValue.includes(',') || /[\r\n]/.test(stringValue)) {
+    // Use string replacement instead of regex to avoid parsing issues
+    const escaped = stringValue.split('"').join('""')
+    return `"${escaped}"`
+  }
+
+  return stringValue
+}
+
 // CSV export helper
 async function appendProjectToCSV(project) {
-  const csvPath = path.join(dataPath, 'projects_log.csv')
-  const headers = 'ID,Project Number,Quote Number,PO Number,Customer,Industry,Product,Control,Scope,Created At\n'
-  
-  // Check if file exists
+  const csvPath = await resolveRuntimePath(path.join('OUTPUT', 'quote_project_log.csv'))
+  const headers = 'ID,Project Number,Quote Number,Project Name,Customer,Industry,Product,Control,Scope,PO Number,Created At\n'
+
+  await ensureDirectoryForFile(csvPath)
+
   let fileExists = false
   try {
     await fs.access(csvPath)
@@ -363,15 +1542,121 @@ async function appendProjectToCSV(project) {
   } catch {
     // File doesn't exist
   }
-  
-  // Write headers if file doesn't exist
+
   if (!fileExists) {
     await fs.writeFile(csvPath, headers, 'utf-8')
   }
-  
-  // Append project row
-  const row = `${project.id},${project.projectNumber},${project.quoteNumber},${project.poNumber || ''},${project.customer},${project.industry},${project.product},${project.control},${project.scope},${project.createdAt}\n`
+
+  const rowValues = [
+    project.id || '',
+    project.projectNumber || '',
+    project.quoteNumber || '',
+    project.projectName || '',
+    project.customer || '',
+    project.industry || '',
+    project.product || '',
+    project.control || '',
+    project.scope || '',
+    project.poNumber || '',
+    project.createdAt || new Date().toISOString()
+  ]
+
+  const row = `${rowValues.map(csvEscape).join(',')}\n`
   await fs.appendFile(csvPath, row, 'utf-8')
+}
+
+async function writeQuoteSnapshotCSV(quoteObject) {
+  if (!quoteObject) {
+    return
+  }
+
+  const rawIdentifier = (quoteObject.quoteId || quoteObject.id || 'quote').toString()
+  const safeIdentifier = rawIdentifier.replace(/[^A-Za-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '') || 'quote'
+  const timestamp = new Date().toISOString()
+  const safeTimestamp = timestamp.replace(/[:.]/g, '-').replace(/\s+/g, '_')
+
+  const quotesDir = await resolveRuntimePath(path.join('OUTPUT', 'quotes'))
+  const historyDir = await resolveRuntimePath(path.join('OUTPUT', 'quotes', 'history'))
+  const currentPath = path.join(quotesDir, `${safeIdentifier}.csv`)
+  const historicalPath = path.join(historyDir, `${safeIdentifier}_${safeTimestamp}.csv`)
+
+  const summaryPairs = [
+    ['Quote ID', quoteObject.quoteId || ''],
+    ['Project Name', quoteObject.projectName || ''],
+    ['Customer', quoteObject.customer || ''],
+    ['Sales Rep', quoteObject.salesRep || ''],
+    ['Status', quoteObject.status || ''],
+    ['Industry Code', quoteObject.projectCodes?.industry || ''],
+    ['Product Code', quoteObject.projectCodes?.product || ''],
+    ['Control Code', quoteObject.projectCodes?.control || ''],
+    ['Scope Code', quoteObject.projectCodes?.scope || ''],
+    ['Material Cost', Number(quoteObject.pricing?.materialCost || 0).toFixed(2)],
+    ['Labor Cost', Number(quoteObject.pricing?.laborCost || 0).toFixed(2)],
+    ['Total COGS', Number(quoteObject.pricing?.totalCOGS || 0).toFixed(2)],
+    ['Margin Percent', Number(quoteObject.pricing?.marginPercent || 0).toFixed(2)],
+    ['Sell Price', Number(quoteObject.pricing?.finalPrice || 0).toFixed(2)],
+    ['Operational Item Count', Array.isArray(quoteObject.operationalItems) ? quoteObject.operationalItems.length : 0],
+    ['Last Updated', timestamp]
+  ]
+
+  const lines = ['Field,Value']
+  summaryPairs.forEach(([key, value]) => {
+    lines.push(`${csvEscape(key)},${csvEscape(value)}`)
+  })
+
+  const operationalItems = Array.isArray(quoteObject.operationalItems) ? quoteObject.operationalItems : []
+
+  lines.push('')
+
+  if (operationalItems.length > 0) {
+    const itemHeader = [
+      'SKU',
+      'Description',
+      'Display Name',
+      'Quantity',
+      'Unit Price',
+      'Total Price',
+      'Vendor',
+      'VN#',
+      'Category',
+      'Section Group',
+      'Source Assembly',
+      'Source Rule',
+      'Notes'
+    ]
+
+    lines.push(itemHeader.map(csvEscape).join(','))
+
+    operationalItems.forEach(item => {
+      const row = [
+        item?.sku || '',
+        item?.description || '',
+        item?.displayName || '',
+        item?.quantity ?? 0,
+        typeof item?.unitPrice === 'number' ? item.unitPrice.toFixed(2) : item?.unitPrice || '',
+        typeof item?.totalPrice === 'number' ? item.totalPrice.toFixed(2) : item?.totalPrice || '',
+        item?.vendor || '',
+        item?.vndrnum || '',
+        item?.category || '',
+        item?.sectionGroup || '',
+        item?.sourceAssembly || '',
+        item?.sourceRule || '',
+        item?.notes || ''
+      ]
+
+      lines.push(row.map(csvEscape).join(','))
+    })
+  } else {
+    lines.push(csvEscape('No operational items generated'))
+  }
+
+  const csvContent = lines.join('\n')
+
+  await ensureDirectoryForFile(currentPath)
+  await fs.writeFile(currentPath, csvContent, 'utf-8')
+
+  await ensureDirectoryForFile(historicalPath)
+  await fs.writeFile(historicalPath, csvContent, 'utf-8')
 }
 
 function createSplashWindow() {
@@ -388,99 +1673,54 @@ function createSplashWindow() {
   });
 
   // Create a simple HTML splash screen
-  const splashHTML = `
-    <!DOCTYPE html>
-    <html>
-      <head>
-        <style>
-          * { margin: 0; padding: 0; box-sizing: border-box; }
-          body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-            background: transparent;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            height: 100vh;
-          }
-          .splash {
-            background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
-            border-radius: 16px;
-            padding: 40px;
-            text-align: center;
-            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
-            width: 100%;
-            height: 100%;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-          }
-          .logo {
-            font-size: 48px;
-            font-weight: 800;
-            background: linear-gradient(135deg, #3b82f6 0%, #06b6d4 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            margin-bottom: 20px;
-          }
-          .title {
-            color: white;
-            font-size: 24px;
-            font-weight: 600;
-            margin-bottom: 30px;
-          }
-          .loader {
-            width: 60px;
-            height: 60px;
-            border: 4px solid rgba(59, 130, 246, 0.2);
-            border-top-color: #3b82f6;
-            border-radius: 50%;
-            animation: spin 1s linear infinite;
-          }
-          @keyframes spin {
-            to { transform: rotate(360deg); }
-          }
-          .status {
-            color: #94a3b8;
-            font-size: 14px;
-            margin-top: 20px;
-          }
-        </style>
-      </head>
-      <body>
-        <div class="splash">
-          <div class="logo">⚙️</div>
-          <div class="title">Craft Tools Hub</div>
-          <div class="loader"></div>
-          <div class="status">Loading workspace...</div>
-        </div>
-      </body>
-    </html>
-  `;
+  const splashHTML = '<!DOCTYPE html><html><head><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:transparent;display:flex;align-items:center;justify-content:center;height:100vh}.splash{background:linear-gradient(135deg,#1e293b 0%,#334155 100%);border-radius:16px;padding:40px;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,0.5);width:100%;height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center}.logo{font-size:48px;font-weight:800;background:linear-gradient(135deg,#3b82f6 0%,#06b6d4 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:20px}.title{color:white;font-size:24px;font-weight:600;margin-bottom:30px}.loader{width:60px;height:60px;border:4px solid rgba(59,130,246,0.2);border-top-color:#3b82f6;border-radius:50%;animation:spin 1s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.status{color:#94a3b8;font-size:14px;margin-top:20px}</style></head><body><div class="splash"><div class="logo">⚙️</div><div class="title">Craft Automation CPQ (Configure, Price Quote)</div><div class="loader"></div><div class="status">Loading workspace...</div></div></body></html>';
 
   splashWindow.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(splashHTML));
 }
 
 function createWindow() {
+  // Determine preload script path
+  // In production, use built preload.cjs
+  // In development, prefer built preload.cjs if it exists, otherwise use source preload.js
+  let preloadPath
+  if (app.isPackaged) {
+    preloadPath = path.join(__dirname, 'preload.cjs')
+  } else {
+    // Check if built version exists (from dist-electron), otherwise use source
+    const builtPreload = path.join(__dirname, '..', 'dist-electron', 'preload.cjs')
+    const sourcePreload = path.join(__dirname, 'preload.js')
+    
+    try {
+      // Try to use built version if it exists
+      if (fssync.existsSync(builtPreload)) {
+        preloadPath = builtPreload
+      } else {
+        preloadPath = sourcePreload
+      }
+    } catch {
+      preloadPath = sourcePreload
+    }
+  }
+  
   mainWindow = new BrowserWindow({
     width: 1200,
     height: 800,
     show: false, // Don't show until ready
     webPreferences: {
-      // Use CommonJS preload bundle
-      preload: path.join(__dirname, 'preload.cjs'),
+      preload: preloadPath,
       nodeIntegration: false,
       contextIsolation: true,
       sandbox: false,
-      contentSecurityPolicy: "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.tailwindcss.com https://unpkg.com; style-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com; connect-src 'self' https://unpkg.com;",
+      contentSecurityPolicy: "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://unpkg.com; style-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com; connect-src 'self' http://localhost:3001 https://unpkg.com;",
     },
   })
 
   // In development, load from Vite dev server; in production, load from dist folder
-  if (process.env.NODE_ENV === 'development' || !app.isPackaged) {
-    mainWindow.loadURL('http://localhost:5173')
+  const distPath = path.join(__dirname, '../dist/index.html')
+  if (isDev && !fssync.existsSync(distPath)) {
+    mainWindow.loadURL('http://localhost:5174')
   } else {
-    mainWindow.loadFile(path.join(__dirname, '../dist/index.html'))
+    mainWindow.loadFile(distPath)
   }
   mainWindow.webContents.openDevTools()
 
@@ -562,25 +1802,30 @@ app.whenReady().then(async () => {
   
   await initDataStorage()
   await initPluginsDirectory()
+  await initEmbeddedServer()
+  await initializeGeneratedNumbersDatabase()
   await loadPlugins()
   await loadComponents()
-  await loadAssemblies()
+  await loadSubAssemblies()
   
   // Load quote schema
   let quoteSchemaPath
   if (process.env.NODE_ENV === 'development' || !app.isPackaged) {
     quoteSchemaPath = path.join(__dirname, '..', 'src', 'data', 'quotes', 'project_quote_schema.json')
   } else {
-    quoteSchemaPath = path.join(process.resourcesPath, 'data', 'quotes', 'project_quote_schema.json')
+    quoteSchemaPath = path.join(process.resourcesPath, 'app.asar', 'src', 'data', 'quotes', 'project_quote_schema.json')
   }
   const quoteSchemaData = await fs.readFile(quoteSchemaPath, 'utf-8')
   quoteSchema = JSON.parse(quoteSchemaData)
   const ajv = new Ajv()
   quoteValidate = ajv.compile(quoteSchema)
   
-  // Populate cachedAllAssemblies after initial loads
-  cachedAllAssemblies = await getAllAssemblies();
-  console.log(`Cached ${cachedAllAssemblies.length} assemblies.`);
+  // Populate cached sub-assemblies after initial loads
+  cachedSubAssemblies = await getAllSubAssemblies();
+  console.log(`Cached ${cachedSubAssemblies.length} sub-assemblies.`);
+  
+  // Initialize Sync Manager
+  await initializeSyncManager()
   
   createMenu();
   createWindow()
@@ -594,7 +1839,60 @@ app.whenReady().then(async () => {
   
   app.on('window-all-closed', () => {
     if (process.platform !== 'darwin') {
-      app.quit()
+      // Close the embedded server and databases before quitting
+      if (serverInstance) {
+        serverInstance.close(async () => {
+          console.log('Embedded server closed')
+          if (syncManager) {
+            await syncManager.cleanup()
+            console.log('Sync manager cleaned up')
+          }
+          if (serverDb) {
+            await serverDb.close()
+            console.log('Main database closed')
+          }
+          if (generatedNumbersDb) {
+            await generatedNumbersDb.close()
+            console.log('Generated numbers database closed')
+          }
+          app.quit()
+        })
+      } else {
+        // Close databases even if no server
+        if (syncManager) {
+          syncManager.cleanup().then(async () => {
+            console.log('Sync manager cleaned up')
+            if (serverDb) {
+              await serverDb.close()
+              console.log('Main database closed')
+            }
+            if (generatedNumbersDb) {
+              await generatedNumbersDb.close()
+              console.log('Generated numbers database closed')
+            }
+            app.quit()
+          })
+        } else if (serverDb) {
+          serverDb.close().then(() => {
+            console.log('Main database closed')
+            if (generatedNumbersDb) {
+              generatedNumbersDb.close().then(() => {
+                console.log('Generated numbers database closed')
+                app.quit()
+              })
+            } else {
+              app.quit()
+            }
+          })
+        } else if (generatedNumbersDb) {
+          generatedNumbersDb.close().then(() => {
+            console.log('Generated numbers database closed')
+            app.quit()
+          })
+        } else {
+          app.quit()
+        }
+      }
     }
   })
   
@@ -613,6 +1911,66 @@ app.whenReady().then(async () => {
       author: plugin.author
     }))
   })
+
+// Sync Manager IPC handlers
+
+// Get sync status (last sync time, next sync time, enabled status)
+ipcMain.handle('sync:getStatus', async () => {
+  try {
+    if (!syncManager) {
+      return {
+        enabled: false,
+        message: 'Sync manager not initialized'
+      }
+    }
+    return syncManager.getStatus()
+  } catch (error) {
+    console.error('Error getting sync status:', error)
+    throw error
+  }
+})
+
+// Trigger manual sync
+ipcMain.handle('sync:manual', async () => {
+  try {
+    if (!syncManager) {
+      throw new Error('Sync manager not initialized')
+    }
+    await syncManager.sync()
+    return { success: true, message: 'Sync completed successfully' }
+  } catch (error) {
+    console.error('Error during manual sync:', error)
+    throw error
+  }
+})
+
+// Update sync schedule
+ipcMain.handle('sync:setSchedule', async (event, intervalMinutes) => {
+  try {
+    if (!syncManager) {
+      throw new Error('Sync manager not initialized')
+    }
+    await syncManager.stopScheduledSync()
+    await syncManager.startScheduledSync(intervalMinutes)
+    return { success: true, message: `Sync schedule updated to ${intervalMinutes} minutes` }
+  } catch (error) {
+    console.error('Error updating sync schedule:', error)
+    throw error
+  }
+})
+
+// Get sync history/logs
+ipcMain.handle('sync:getHistory', async () => {
+  try {
+    if (!syncManager) {
+      return []
+    }
+    return await syncManager.getSyncHistory()
+  } catch (error) {
+    console.error('Error getting sync history:', error)
+    throw error
+  }
+})
   
 // Get HTML content for a specific plugin
 ipcMain.handle('plugins:getHTML', async (event, pluginId) => {
@@ -628,6 +1986,77 @@ ipcMain.handle('plugins:getHTML', async (event, pluginId) => {
   } catch (err) {
     console.error(`Error loading plugin HTML for ${pluginId}:`, err)
     throw err
+  }
+})
+
+// Runtime and NAS diagnostic IPC handlers
+ipcMain.handle('runtime:getStatus', async () => {
+  try {
+    const status = await getRuntimeStatus()
+    return status
+  } catch (err) {
+    console.error('Error getting runtime status via IPC:', err)
+    return { ok: false, error: String(err.message || err) }
+  }
+})
+
+ipcMain.handle('runtime:runDiagnostics', async (event, options = {}) => {
+  try {
+    // Run the repository diagnostics script in non-destructive mode and return JSON output
+    const scriptPath = path.join(__dirname, '..', 'scripts', 'nas-diagnostics.js')
+    const { execFileSync } = await import('child_process')
+    const args = []
+    // Prefer resolved runtime root when available
+    if (resolvedRuntimeRoot) {
+      args.push('--root', resolvedRuntimeRoot)
+    }
+    // Respect options
+    if (options.skipPing) args.push('--skip-ping')
+    if (options.skipWrite !== false) args.push('--skip-write')
+    args.push('--json')
+
+    try {
+      // Use `node` executable; assume node is available in PATH in dev/test environments
+      const stdout = execFileSync('node', [scriptPath, ...args], { encoding: 'utf8', timeout: 60000 })
+      try {
+        return JSON.parse(stdout)
+      } catch (parseErr) {
+        return { ok: false, error: 'Diagnostics produced non-JSON output', raw: stdout }
+      }
+    } catch (execErr) {
+      console.error('Diagnostics script failed:', execErr)
+      return { ok: false, error: String(execErr.message || execErr) }
+    }
+  } catch (err) {
+    console.error('Error running diagnostics via IPC:', err)
+    return { ok: false, error: String(err.message || err) }
+  }
+})
+
+// Backwards-compatible handler (`runtime:run-diagnostics`)
+ipcMain.handle('runtime:run-diagnostics', async (event, options = {}) => {
+  return ipcMain.invoke ? ipcMain.invoke('runtime:runDiagnostics', options) : await (async () => {
+    try {
+      return await (async () => {
+        const status = await getRuntimeStatus()
+        return { ok: true, status }
+      })()
+    } catch (err) {
+      return { ok: false, error: String(err.message || err) }
+    }
+  })()
+})
+
+// Network credential IPC handlers moved to avoid duplicates (see line ~5147)
+
+ipcMain.on('credentials:save', async (event, creds) => {
+  try {
+    if (creds && creds.username && creds.password) {
+      const saved = await saveNetworkCredentials(creds.username, creds.password)
+      if (saved) networkCredentials = { username: creds.username }
+    }
+  } catch (err) {
+    console.error('Error saving credentials via IPC:', err)
   }
 })
 
@@ -872,11 +2301,18 @@ ipcMain.handle('components:sync-from-csv', async (event, csvContent) => {
       }
     }
 
+    const sanitizedCatalog = sanitizeComponentCatalog(masterCatalog)
+    const removedCount = masterCatalog.length - sanitizedCatalog.length
+
     // 4. Write the updated catalog back to disk
-    await fs.writeFile(catalogPath, JSON.stringify(masterCatalog, null, 2));
+    await fs.writeFile(catalogPath, JSON.stringify(sanitizedCatalog, null, 2));
     
     // 5. Reload components into memory
-    loadedComponents = masterCatalog;
+    loadedComponents = sanitizedCatalog;
+
+    if (removedCount > 0) {
+      console.log(`Excluded ${removedCount} catalog entries with missing pricing during sync`)
+    }
 
     return { success: true, updated: updatedCount, added: newCount };
   } catch (error) {
@@ -885,122 +2321,863 @@ ipcMain.handle('components:sync-from-csv', async (event, csvContent) => {
   }
 });
 
-// Assembly IPC handlers
+// Database-based IPC handlers for new tables
 
-// Get all assemblies (user data + bundled)
-// Helper to get all assemblies (bundled + user)
-async function getAllAssemblies() {
+// Sub-assemblies database handlers
+ipcMain.handle('db:sub-assemblies:getAll', async () => {
   try {
-    // Load from root assemblies.json (where save writes to)
-    let userAssemblies = await readJSONFile('assemblies.json') || [];
-    const assembliesPath = path.join(dataPath, 'assemblies.json');
-    console.log(`Loaded ${userAssemblies.length} user assemblies from: ${assembliesPath}`);
+    if (!serverDb) {
+      return await getAllSubAssemblies(); // Fallback to JSON
+    }
+    const subAssemblies = await serverDb.all('SELECT * FROM sub_assemblies ORDER BY updated_at DESC');
+    return subAssemblies.map(sa => ({
+      ...sa,
+      attributes: sa.attributes ? JSON.parse(sa.attributes) : {},
+      components: sa.components ? JSON.parse(sa.components) : []
+    }));
+  } catch (error) {
+    console.error('Error fetching sub-assemblies from database:', error);
+    return await getAllSubAssemblies(); // Fallback to JSON
+  }
+});
+
+ipcMain.handle('db:sub-assemblies:save', async (event, subAssembly) => {
+  try {
+    if (!serverDb) {
+      return await ipcMain.handle('sub-assemblies:save', event, subAssembly); // Fallback to JSON
+    }
+
+    const now = new Date().toISOString();
+    const data = {
+      subAssemblyId: subAssembly.subAssemblyId || subAssembly.assemblyId,
+      description: subAssembly.description,
+      category: subAssembly.category,
+      attributes: JSON.stringify(subAssembly.attributes || {}),
+      components: JSON.stringify(subAssembly.components || []),
+      estimatedLaborHours: subAssembly.estimatedLaborHours || 0,
+      isBundled: subAssembly.isBundled ? 1 : 0,
+      isUserCreated: subAssembly.isUserCreated ? 1 : 0,
+      updated_at: now
+    };
+
+    // Check if sub-assembly exists
+    const existing = await serverDb.get('SELECT subAssemblyId FROM sub_assemblies WHERE subAssemblyId = ?', [data.subAssemblyId]);
+
+    if (existing) {
+      // Update
+      await serverDb.run(`
+        UPDATE sub_assemblies SET
+          description = ?, category = ?, attributes = ?, components = ?,
+          estimatedLaborHours = ?, isBundled = ?, isUserCreated = ?, updated_at = ?
+        WHERE subAssemblyId = ?
+      `, [
+        data.description, data.category, data.attributes, data.components,
+        data.estimatedLaborHours, data.isBundled, data.isUserCreated, data.updated_at,
+        data.subAssemblyId
+      ]);
+    } else {
+      // Insert
+      data.created_at = now;
+      await serverDb.run(`
+        INSERT INTO sub_assemblies (
+          subAssemblyId, description, category, attributes, components,
+          estimatedLaborHours, isBundled, isUserCreated, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        data.subAssemblyId, data.description, data.category, data.attributes, data.components,
+        data.estimatedLaborHours, data.isBundled, data.isUserCreated, data.created_at, data.updated_at
+      ]);
+    }
+
+    return { success: true, data: subAssembly };
+  } catch (error) {
+    console.error('Error saving sub-assembly to database:', error);
+    return await ipcMain.handle('sub-assemblies:save', event, subAssembly); // Fallback to JSON
+  }
+});
+
+ipcMain.handle('db:sub-assemblies:getById', async (event, subAssemblyId) => {
+  try {
+    if (!serverDb) {
+      return await ipcMain.handle('sub-assemblies:getById', event, subAssemblyId); // Fallback to JSON
+    }
+
+    const row = await serverDb.get('SELECT * FROM sub_assemblies WHERE subAssemblyId = ?', [subAssemblyId]);
+    if (!row) return null;
+
+    return {
+      ...row,
+      attributes: row.attributes ? JSON.parse(row.attributes) : {},
+      components: row.components ? JSON.parse(row.components) : []
+    };
+  } catch (error) {
+    console.error('Error fetching sub-assembly from database:', error);
+    return await ipcMain.handle('sub-assemblies:getById', event, subAssemblyId); // Fallback to JSON
+  }
+});
+
+// Quotes database handlers
+ipcMain.handle('db:quotes:getAll', async () => {
+  try {
+    if (!serverDb) {
+      return await ipcMain.handle('quote:get-all'); // Fallback to JSON
+    }
+    const quotes = await serverDb.all('SELECT * FROM quotes ORDER BY updated_at DESC');
+    return quotes.map(q => ({
+      ...q,
+      projectCodes: q.projectCodes ? JSON.parse(q.projectCodes) : {},
+      controlPanelConfig: q.controlPanelConfig ? JSON.parse(q.controlPanelConfig) : {},
+      operationalItems: q.operationalItems ? JSON.parse(q.operationalItems) : [],
+      pricing: q.pricing ? JSON.parse(q.pricing) : {},
+      bom: q.bom ? JSON.parse(q.bom) : null
+    }));
+  } catch (error) {
+    console.error('Error fetching quotes from database:', error);
+    return await ipcMain.handle('quote:get-all'); // Fallback to JSON
+  }
+});
+
+ipcMain.handle('db:quotes:save', async (event, quote) => {
+  try {
+    if (!serverDb) {
+      return await ipcMain.handle('quote:save', event, quote); // Fallback to JSON
+    }
+
+    const now = new Date().toISOString();
+    const data = {
+      quoteId: quote.quoteId,
+      projectName: quote.projectName || '',
+      customer: quote.customer || '',
+      salesRep: quote.salesRep || '',
+      status: quote.status || 'draft',
+      projectCodes: JSON.stringify(quote.projectCodes || {}),
+      controlPanelConfig: JSON.stringify(quote.controlPanelConfig || {}),
+      operationalItems: JSON.stringify(quote.operationalItems || []),
+      pricing: JSON.stringify(quote.pricing || {}),
+      bom: JSON.stringify(quote.bom || null),
+      updated_at: now
+    };
+
+    // Check if quote exists
+    const existing = await serverDb.get('SELECT quoteId FROM quotes WHERE quoteId = ?', [data.quoteId]);
+
+    if (existing) {
+      // Update
+      await serverDb.run(`
+        UPDATE quotes SET
+          projectName = ?, customer = ?, salesRep = ?, status = ?,
+          projectCodes = ?, controlPanelConfig = ?, operationalItems = ?,
+          pricing = ?, bom = ?, updated_at = ?
+        WHERE quoteId = ?
+      `, [
+        data.projectName, data.customer, data.salesRep, data.status,
+        data.projectCodes, data.controlPanelConfig, data.operationalItems,
+        data.pricing, data.bom, data.updated_at, data.quoteId
+      ]);
+    } else {
+      // Insert
+      data.created_at = now;
+      await serverDb.run(`
+        INSERT INTO quotes (
+          quoteId, projectName, customer, salesRep, status,
+          projectCodes, controlPanelConfig, operationalItems,
+          pricing, bom, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        data.quoteId, data.projectName, data.customer, data.salesRep, data.status,
+        data.projectCodes, data.controlPanelConfig, data.operationalItems,
+        data.pricing, data.bom, data.created_at, data.updated_at
+      ]);
+    }
+
+    return { success: true, data: quote };
+  } catch (error) {
+    console.error('Error saving quote to database:', error);
+    return await ipcMain.handle('quote:save', event, quote); // Fallback to JSON
+  }
+});
+
+ipcMain.handle('db:quotes:getById', async (event, quoteId) => {
+  try {
+    if (!serverDb) {
+      return await ipcMain.handle('quote:get-by-id', event, quoteId); // Fallback to JSON
+    }
+
+    const row = await serverDb.get('SELECT * FROM quotes WHERE quoteId = ?', [quoteId]);
+    if (!row) return null;
+
+    return {
+      ...row,
+      projectCodes: row.projectCodes ? JSON.parse(row.projectCodes) : {},
+      controlPanelConfig: row.controlPanelConfig ? JSON.parse(row.controlPanelConfig) : {},
+      operationalItems: row.operationalItems ? JSON.parse(row.operationalItems) : [],
+      pricing: row.pricing ? JSON.parse(row.pricing) : {},
+      bom: row.bom ? JSON.parse(row.bom) : null
+    };
+  } catch (error) {
+    console.error('Error fetching quote from database:', error);
+    return await ipcMain.handle('quote:get-by-id', event, quoteId); // Fallback to JSON
+  }
+});
+
+// Operational items database handlers
+ipcMain.handle('db:operational-items:getByQuoteId', async (event, quoteId) => {
+  try {
+    if (!serverDb) {
+      // For JSON fallback, we'd need to get from quotes
+      const quote = await ipcMain.handle('quote:get-by-id', event, quoteId);
+      return quote ? quote.operationalItems || [] : [];
+    }
+
+    const items = await serverDb.all('SELECT * FROM operational_items WHERE quoteId = ? ORDER BY id', [quoteId]);
+    return items;
+  } catch (error) {
+    console.error('Error fetching operational items from database:', error);
+    // Fallback to JSON
+    const quote = await ipcMain.handle('quote:get-by-id', event, quoteId);
+    return quote ? quote.operationalItems || [] : [];
+  }
+});
+
+ipcMain.handle('db:operational-items:saveBulk', async (event, quoteId, items) => {
+  try {
+    if (!serverDb) {
+      // For JSON fallback, we'd need to update the quote
+      const quote = await ipcMain.handle('quote:get-by-id', event, quoteId);
+      if (quote) {
+        quote.operationalItems = items;
+        return await ipcMain.handle('quote:save', event, quote);
+      }
+      return { success: false, error: 'Quote not found' };
+    }
+
+    // First delete existing items for this quote
+    await serverDb.run('DELETE FROM operational_items WHERE quoteId = ?', [quoteId]);
+
+    // Insert new items
+    for (const item of items) {
+      await serverDb.run(`
+        INSERT INTO operational_items (
+          quoteId, sku, description, displayName, quantity, unitPrice, totalPrice,
+          vendor, vndrnum, category, sectionGroup, sourceAssembly, sourceRule, notes
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        quoteId, item.sku || '', item.description || '', item.displayName || '',
+        item.quantity || 0, item.unitPrice || 0, item.totalPrice || 0,
+        item.vendor || '', item.vndrnum || '', item.category || '',
+        item.sectionGroup || '', item.sourceAssembly || '', item.sourceRule || '', item.notes || ''
+      ]);
+    }
+
+    return { success: true };
+  } catch (error) {
+    console.error('Error saving operational items to database:', error);
+    // Fallback to JSON
+    const quote = await ipcMain.handle('quote:get-by-id', event, quoteId);
+    if (quote) {
+      quote.operationalItems = items;
+      return await ipcMain.handle('quote:save', event, quote);
+    }
+    return { success: false, error: error.message };
+  }
+});
+
+// Product templates database handlers
+ipcMain.handle('db:product-templates:getAll', async () => {
+  try {
+    if (!serverDb) {
+      // For JSON fallback, we'd need to scan the product-templates directory
+      return [];
+    }
+    const templates = await serverDb.all('SELECT * FROM product_templates WHERE isActive = 1 ORDER BY productCode');
+    return templates.map(t => ({
+      ...t,
+      templateData: t.templateData ? JSON.parse(t.templateData) : {}
+    }));
+  } catch (error) {
+    console.error('Error fetching product templates from database:', error);
+    return [];
+  }
+});
+
+ipcMain.handle('db:product-templates:getByCode', async (event, productCode) => {
+  try {
+    if (!serverDb) {
+      return await ipcMain.handle('product-templates:get', event, productCode); // Fallback to JSON
+    }
+
+    const row = await serverDb.get('SELECT * FROM product_templates WHERE productCode = ? AND isActive = 1', [productCode]);
+    if (!row) return null;
+
+    return {
+      ...row,
+      templateData: row.templateData ? JSON.parse(row.templateData) : {}
+    };
+  } catch (error) {
+    console.error('Error fetching product template from database:', error);
+    return await ipcMain.handle('product-templates:get', event, productCode); // Fallback to JSON
+  }
+});
+
+ipcMain.handle('db:product-templates:save', async (event, template) => {
+  try {
+    if (!serverDb) {
+      return await ipcMain.handle('product-templates:save', event, template); // Fallback to JSON
+    }
+
+    const now = new Date().toISOString();
+    const data = {
+      productCode: template.productCode,
+      name: template.name,
+      description: template.description || '',
+      templateData: JSON.stringify(template.templateData || {}),
+      isActive: template.isActive !== false ? 1 : 0,
+      updated_at: now
+    };
+
+    // Check if template exists
+    const existing = await serverDb.get('SELECT productCode FROM product_templates WHERE productCode = ?', [data.productCode]);
+
+    if (existing) {
+      // Update
+      await serverDb.run(`
+        UPDATE product_templates SET
+          name = ?, description = ?, templateData = ?, isActive = ?, updated_at = ?
+        WHERE productCode = ?
+      `, [
+        data.name, data.description, data.templateData, data.isActive, data.updated_at, data.productCode
+      ]);
+    } else {
+      // Insert
+      data.created_at = now;
+      await serverDb.run(`
+        INSERT INTO product_templates (
+          productCode, name, description, templateData, isActive, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `, [
+        data.productCode, data.name, data.description, data.templateData,
+        data.isActive, data.created_at, data.updated_at
+      ]);
+    }
+
+    return { success: true, data: template };
+  } catch (error) {
+    console.error('Error saving product template to database:', error);
+    return await ipcMain.handle('product-templates:save', event, template); // Fallback to JSON
+  }
+});
+
+// Projects database handlers
+ipcMain.handle('db:projects:getAll', async () => {
+  try {
+    if (!serverDb) {
+      return await ipcMain.handle('db:loadProjects'); // Fallback to JSON
+    }
+    const projects = await serverDb.all('SELECT * FROM projects ORDER BY created_at DESC');
+    return projects;
+  } catch (error) {
+    console.error('Error fetching projects from database:', error);
+    return await ipcMain.handle('db:loadProjects'); // Fallback to JSON
+  }
+});
+
+ipcMain.handle('db:projects:save', async (event, project) => {
+  try {
+    if (!serverDb) {
+      return await ipcMain.handle('db:saveProject', event, project); // Fallback to JSON
+    }
+
+    const now = new Date().toISOString();
+    const data = {
+      id: project.id,
+      projectNumber: project.projectNumber || '',
+      quoteNumber: project.quoteNumber || '',
+      projectName: project.projectName || '',
+      customer: project.customer || '',
+      industry: project.industry || '',
+      product: project.product || '',
+      control: project.control || '',
+      scope: project.scope || '',
+      poNumber: project.poNumber || '',
+      updated_at: now
+    };
+
+    // Check if project exists
+    const existing = await serverDb.get('SELECT id FROM projects WHERE id = ?', [data.id]);
+
+    if (existing) {
+      // Update
+      await serverDb.run(`
+        UPDATE projects SET
+          projectNumber = ?, quoteNumber = ?, projectName = ?, customer = ?,
+          industry = ?, product = ?, control = ?, scope = ?, poNumber = ?, updated_at = ?
+        WHERE id = ?
+      `, [
+        data.projectNumber, data.quoteNumber, data.projectName, data.customer,
+        data.industry, data.product, data.control, data.scope, data.poNumber, data.updated_at, data.id
+      ]);
+    } else {
+      // Insert
+      data.created_at = now;
+      await serverDb.run(`
+        INSERT INTO projects (
+          id, projectNumber, quoteNumber, projectName, customer,
+          industry, product, control, scope, poNumber, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        data.id, data.projectNumber, data.quoteNumber, data.projectName, data.customer,
+        data.industry, data.product, data.control, data.scope, data.poNumber, data.created_at, data.updated_at
+      ]);
+    }
+
+    return { success: true };
+  } catch (error) {
+    console.error('Error saving project to database:', error);
+    return await ipcMain.handle('db:saveProject', event, project); // Fallback to JSON
+  }
+});
+
+// Customers IPC handlers
+
+ipcMain.handle('db:customers:getAll', async () => {
+  try {
+    if (!serverDb) {
+      // Fallback to JSON-based customers
+      const customCustomers = await readJSONFile('settings.json') || {}
+      const customCustomerData = customCustomers.customCustomers ? JSON.parse(customCustomers.customCustomers) : {}
+      
+      // Merge with default customers
+      const allCustomers = { ...DEFAULT_CUSTOMER_DATA, ...customCustomerData }
+      
+      // Convert to array format expected by plugins
+      return Object.entries(allCustomers).map(([id, name]) => ({
+        id: id,
+        name: name
+      }))
+    }
+
+    const customers = await serverDb.all('SELECT * FROM customers ORDER BY customerCode');
+    return customers.map(customer => ({
+      id: customer.customerCode,
+      name: customer.customerName,
+      isActive: customer.isActive
+    }));
+  } catch (error) {
+    console.error('Error getting customers from database:', error);
+    // Fallback to JSON-based customers
+    const customCustomers = await readJSONFile('settings.json') || {}
+    const customCustomerData = customCustomers.customCustomers ? JSON.parse(customCustomers.customCustomers) : {}
     
-    // Merge with bundled assemblies (user assemblies take precedence)
-    const allAssemblies = [...loadedAssemblies];
+    // Merge with default customers
+    const allCustomers = { ...DEFAULT_CUSTOMER_DATA, ...customCustomerData }
     
-    // Add or update with user assemblies
-    for (const userAssembly of userAssemblies) {
-      const existingIndex = allAssemblies.findIndex(a => a.assemblyId === userAssembly.assemblyId);
+    // Convert to array format expected by plugins
+    return Object.entries(allCustomers).map(([id, name]) => ({
+      id: id,
+      name: name
+    }))
+  }
+});
+
+ipcMain.handle('db:customers:getByCode', async (event, customerCode) => {
+  try {
+    if (!serverDb) {
+      // Fallback to JSON-based customers
+      const customCustomers = await readJSONFile('settings.json') || {}
+      const customCustomerData = customCustomers.customCustomers ? JSON.parse(customCustomers.customCustomers) : {}
+      
+      // Merge with default customers
+      const allCustomers = { ...DEFAULT_CUSTOMER_DATA, ...customCustomerData }
+      
+      const customerName = allCustomers[customerCode];
+      return customerName ? { id: customerCode, name: customerName } : null;
+    }
+
+    const customer = await serverDb.get('SELECT * FROM customers WHERE customerCode = ? AND isActive = 1', [customerCode]);
+    return customer ? {
+      id: customer.customerCode,
+      name: customer.customerName,
+      isActive: customer.isActive
+    } : null;
+  } catch (error) {
+    console.error('Error getting customer by code from database:', error);
+    // Fallback to JSON-based customers
+    const customCustomers = await readJSONFile('settings.json') || {}
+    const customCustomerData = customCustomers.customCustomers ? JSON.parse(customCustomers.customCustomers) : {}
+    
+    // Merge with default customers
+    const allCustomers = { ...DEFAULT_CUSTOMER_DATA, ...customCustomerData }
+    
+    const customerName = allCustomers[customerCode];
+    return customerName ? { id: customerCode, name: customerName } : null;
+  }
+});
+
+ipcMain.handle('db:customers:save', async (event, customer) => {
+  try {
+    if (!serverDb) {
+      return await ipcMain.handle('customers:add', event, { name: customer.name, isOEM: customer.isOEM }); // Fallback to JSON
+    }
+
+    const now = new Date().toISOString();
+    const data = {
+      customerCode: customer.id,
+      customerName: customer.name,
+      isActive: customer.isActive !== false, // Default to true
+      updated_at: now
+    };
+
+    // Check if customer exists
+    const existing = await serverDb.get('SELECT customerCode FROM customers WHERE customerCode = ?', [data.customerCode]);
+
+    if (existing) {
+      // Update
+      await serverDb.run(`
+        UPDATE customers SET
+          customerName = ?, isActive = ?, updated_at = ?
+        WHERE customerCode = ?
+      `, [
+        data.customerName, data.isActive, data.updated_at, data.customerCode
+      ]);
+    } else {
+      // Insert
+      data.created_at = now;
+      await serverDb.run(`
+        INSERT INTO customers (
+          customerCode, customerName, isActive, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?)
+      `, [
+        data.customerCode, data.customerName, data.isActive, data.created_at, data.updated_at
+      ]);
+    }
+
+    return { success: true };
+  } catch (error) {
+    console.error('Error saving customer to database:', error);
+    return await ipcMain.handle('customers:add', event, { name: customer.name, isOEM: customer.isOEM }); // Fallback to JSON
+  }
+});
+
+// Generated numbers database handlers (separate database)
+ipcMain.handle('db:generated-numbers-separate:getAll', async () => {
+  try {
+    if (!generatedNumbersDb) {
+      return []; // No database, return empty
+    }
+    const numbers = await generatedNumbersDb.all('SELECT * FROM generated_numbers ORDER BY generated_at DESC');
+    return numbers;
+  } catch (error) {
+    console.error('Error fetching generated numbers from separate database:', error);
+    return [];
+  }
+});
+
+ipcMain.handle('db:generated-numbers-separate:getByType', async (event, type) => {
+  try {
+    if (!generatedNumbersDb) {
+      return []; // No database, return empty
+    }
+    const numbers = await generatedNumbersDb.all('SELECT * FROM generated_numbers WHERE type = ? ORDER BY generated_at DESC', [type]);
+    return numbers;
+  } catch (error) {
+    console.error('Error fetching generated numbers by type from separate database:', error);
+    return [];
+  }
+});
+
+// Manual quotes database handlers
+ipcMain.handle('db:manual-quotes:getAll', async () => {
+  try {
+    if (!serverDb) {
+      return []; // No database, return empty
+    }
+    const quotes = await serverDb.all('SELECT * FROM manual_quotes ORDER BY created_at DESC');
+    return quotes.map(q => ({
+      ...q,
+      data: q.data ? JSON.parse(q.data) : {}
+    }));
+  } catch (error) {
+    console.error('Error fetching manual quotes from database:', error);
+    return [];
+  }
+});
+
+ipcMain.handle('db:manual-quotes:getByQuoteNumber', async (event, quoteNumber) => {
+  try {
+    if (!serverDb) {
+      return null; // No database, return null
+    }
+    const quote = await serverDb.get('SELECT * FROM manual_quotes WHERE quoteNumber = ?', [quoteNumber]);
+    if (!quote) return null;
+
+    return {
+      ...quote,
+      data: quote.data ? JSON.parse(quote.data) : {}
+    };
+  } catch (error) {
+    console.error('Error fetching manual quote by number from database:', error);
+    return null;
+  }
+});
+
+ipcMain.handle('db:manual-quotes:save', async (event, manualQuote) => {
+  try {
+    if (!serverDb) {
+      return { success: false, error: 'Database not connected' };
+    }
+
+    const now = new Date().toISOString();
+    const data = {
+      quoteNumber: manualQuote.quoteNumber,
+      type: manualQuote.type,
+      data: JSON.stringify(manualQuote.data || {}),
+      projectName: manualQuote.projectName || null,
+      customer: manualQuote.customer || null,
+      updated_at: now
+    };
+
+    // Check if manual quote exists
+    const existing = await serverDb.get('SELECT quoteNumber FROM manual_quotes WHERE quoteNumber = ?', [data.quoteNumber]);
+
+    if (existing) {
+      // Update
+      await serverDb.run(`
+        UPDATE manual_quotes SET
+          type = ?, data = ?, projectName = ?, customer = ?, updated_at = ?
+        WHERE quoteNumber = ?
+      `, [
+        data.type, data.data, data.projectName, data.customer, data.updated_at, data.quoteNumber
+      ]);
+    } else {
+      // Insert
+      data.created_at = now;
+      await serverDb.run(`
+        INSERT INTO manual_quotes (
+          quoteNumber, type, data, projectName, customer, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `, [
+        data.quoteNumber, data.type, data.data, data.projectName, data.customer, data.created_at, data.updated_at
+      ]);
+    }
+
+    return { success: true, data: manualQuote };
+  } catch (error) {
+    console.error('Error saving manual quote to database:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('db:manual-quotes:delete', async (event, quoteNumber) => {
+  try {
+    if (!serverDb) {
+      return { success: false, error: 'Database not connected' };
+    }
+
+    await serverDb.run('DELETE FROM manual_quotes WHERE quoteNumber = ?', [quoteNumber]);
+    return { success: true };
+  } catch (error) {
+    console.error('Error deleting manual quote from database:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Sub-Assembly IPC handlers
+
+// Get all sub-assemblies (user data + bundled)
+// Helper to get all sub-assemblies (bundled + user)
+async function getAllSubAssemblies() {
+  try {
+    // Load from root sub_assemblies.json (where save writes to)
+    let userSubAssemblies = await readJSONFile('sub_assemblies.json') || [];
+    const subAssembliesPath = path.join(dataPath, 'sub_assemblies.json');
+    console.log(`Loaded ${userSubAssemblies.length} user sub-assemblies from: ${subAssembliesPath}`);
+    
+    // Start with bundled sub-assemblies and mark them as bundled
+    const allSubAssemblies = loadedSubAssemblies.map(assembly => ({
+      ...assembly,
+      isBundled: true,
+      isUserCreated: false
+    }));
+    
+    // Add or update with user sub-assemblies (mark them as user-created)
+    // Support both assemblyId (legacy) and subAssemblyId (new) for matching
+    for (const userSubAssembly of userSubAssemblies) {
+      const userAssemblyId = userSubAssembly.subAssemblyId || userSubAssembly.assemblyId;
+      const existingIndex = allSubAssemblies.findIndex(a => {
+        const existingId = a.subAssemblyId || a.assemblyId;
+        return existingId === userAssemblyId;
+      });
       if (existingIndex >= 0) {
-        allAssemblies[existingIndex] = userAssembly;
+        // User sub-assembly overrides bundled one
+        allSubAssemblies[existingIndex] = {
+          ...userSubAssembly,
+          isBundled: false,
+          isUserCreated: true
+        };
       } else {
-        allAssemblies.push(userAssembly);
+        // New user sub-assembly
+        allSubAssemblies.push({
+          ...userSubAssembly,
+          isBundled: false,
+          isUserCreated: true
+        });
       }
     }
     
-    console.log(`Total assemblies after merge: ${allAssemblies.length} (${loadedAssemblies.length} bundled + ${userAssemblies.length} user)`);
-    return allAssemblies;
+    console.log(`Total sub-assemblies after merge: ${allSubAssemblies.length} (${loadedSubAssemblies.length} bundled + ${userSubAssemblies.length} user)`);
+    return allSubAssemblies;
   } catch (err) {
-    console.error('Error loading assemblies:', err);
-    return loadedAssemblies;
+    console.error('Error loading sub-assemblies:', err);
+    return loadedSubAssemblies.map(assembly => ({
+      ...assembly,
+      isBundled: true,
+      isUserCreated: false
+    }));
   }
 }
 
-ipcMain.handle('assemblies:getAll', async () => {
-  // Return cached assemblies for performance, or rebuild if cache is empty
-  if (cachedAllAssemblies.length === 0) {
-    cachedAllAssemblies = await getAllAssemblies();
+async function expandSubAssemblyById(subAssemblyId) {
+  if (!subAssemblyId) {
+    return null;
   }
-  console.log(`Returning ${cachedAllAssemblies.length} cached assemblies`);
-  return cachedAllAssemblies;
+
+  const allAssemblies = await getAllSubAssemblies();
+  const subAssembly = allAssemblies.find(a => (a.subAssemblyId || a.assemblyId) === subAssemblyId);
+  if (!subAssembly) {
+    return null;
+  }
+
+  const expandedComponents = Array.isArray(subAssembly.components)
+    ? subAssembly.components.map(componentEntry => {
+        const quantity = Number(componentEntry.quantity) || 0;
+        const trimmedSku = componentEntry.sku?.trim();
+        const component = trimmedSku ? loadedComponents.find(c => c.sku === trimmedSku) : null;
+
+        return {
+          ...componentEntry,
+          sku: trimmedSku,
+          quantity,
+          component: component || null,
+          subtotal: component ? (component.price || 0) * quantity : 0,
+        };
+      })
+    : [];
+
+  const totalCost = expandedComponents.reduce((sum, entry) => sum + (Number(entry.subtotal) || 0), 0);
+
+  return {
+    ...subAssembly,
+    components: expandedComponents,
+    totalCost,
+    totalLaborCost: subAssembly.estimatedLaborHours || 0,
+  };
+}
+
+ipcMain.handle('sub-assemblies:getAll', async () => {
+  // Return cached assemblies for performance, or rebuild if cache is empty
+  if (cachedSubAssemblies.length === 0) {
+    cachedSubAssemblies = await getAllSubAssemblies();
+  }
+  console.log(`Returning ${cachedSubAssemblies.length} cached sub-assemblies`);
+  return cachedSubAssemblies;
 })
 
-// Save an assembly (validate against schema first)
-ipcMain.handle('assemblies:save', async (event, assemblyToSave) => {
+// Save a sub-assembly (validate against schema first)
+ipcMain.handle('sub-assemblies:save', async (event, subAssemblyToSave) => {
   try {
-    // Load assembly schema
-    let assemblySchemaPath
+    // Load sub-assembly schema
+    let subAssemblySchemaPath
     if (process.env.NODE_ENV === 'development' || !app.isPackaged) {
-      assemblySchemaPath = path.join(__dirname, '..', 'src', 'data', 'schemas', 'assembly_schema.json')
+      subAssemblySchemaPath = path.join(__dirname, '..', 'src', 'data', 'schemas', 'sub_assembly_schema.json')
     } else {
-      assemblySchemaPath = path.join(process.resourcesPath, 'data', 'schemas', 'assembly_schema.json')
+      subAssemblySchemaPath = path.join(process.resourcesPath, 'app.asar', 'src', 'data', 'schemas', 'sub_assembly_schema.json')
     }
     
-    const schemaData = await fs.readFile(assemblySchemaPath, 'utf-8')
-    const assemblySchema = JSON.parse(schemaData)
+    const schemaData = await fs.readFile(subAssemblySchemaPath, 'utf-8')
+    const subAssemblySchema = JSON.parse(schemaData)
     const ajv = new Ajv()
-    const validate = ajv.compile(assemblySchema)
+    const validate = ajv.compile(subAssemblySchema)
     
-    // Validate the assembly
-    const valid = validate(assemblyToSave)
+    // Validate the sub-assembly
+    // Support both assemblyId (legacy) and subAssemblyId (new) for backward compatibility
+    const subAssemblyData = {
+      ...subAssemblyToSave,
+      subAssemblyId: subAssemblyToSave.subAssemblyId || subAssemblyToSave.assemblyId
+    }
+    const valid = validate(subAssemblyData)
     if (!valid) {
       return { success: false, errors: validate.errors }
     }
     
-    // Load existing user assemblies
-    let userAssemblies = await readJSONFile('assemblies.json') || []
+    // Load existing user sub-assemblies
+    let userSubAssemblies = await readJSONFile('sub_assemblies.json') || []
     
     // Find and replace or add new
-    const existingIndex = userAssemblies.findIndex(a => a.assemblyId === assemblyToSave.assemblyId)
+    // Support both assemblyId and subAssemblyId for lookup
+    const targetId = subAssemblyData.subAssemblyId || subAssemblyData.assemblyId
+    const existingIndex = userSubAssemblies.findIndex(a => 
+      (a.subAssemblyId || a.assemblyId) === targetId
+    )
     if (existingIndex >= 0) {
-      userAssemblies[existingIndex] = assemblyToSave
+      userSubAssemblies[existingIndex] = subAssemblyData
     } else {
-      userAssemblies.push(assemblyToSave)
+      userSubAssemblies.push(subAssemblyData)
     }
     
     // Save back to file
-    const savePath = path.join(dataPath, 'assemblies.json')
-    await writeJSONFile('assemblies.json', userAssemblies)
-    console.log(`✓ Assembly saved to: ${savePath}`)
-    console.log(`  - Assembly ID: ${assemblyToSave.assemblyId}`)
-    console.log(`  - Description: ${assemblyToSave.description}`)
-    console.log(`  - Category: ${assemblyToSave.category}`)
-    console.log(`  - Total assemblies in file: ${userAssemblies.length}`)
+    const savePath = path.join(dataPath, 'sub_assemblies.json')
+    await writeJSONFile('sub_assemblies.json', userSubAssemblies)
+    console.log(`✓ Sub-Assembly saved to: ${savePath}`)
+    console.log(`  - Sub-Assembly ID: ${targetId}`)
+    console.log(`  - Description: ${subAssemblyData.description}`)
+    console.log(`  - Category: ${subAssemblyData.category}`)
+    console.log(`  - Total sub-assemblies in file: ${userSubAssemblies.length}`)
     
     // Refresh the cache
-    cachedAllAssemblies = await getAllAssemblies()
-    console.log(`✓ Cache refreshed with ${cachedAllAssemblies.length} assemblies`)
+    cachedSubAssemblies = await getAllSubAssemblies()
+    console.log(`✓ Cache refreshed with ${cachedSubAssemblies.length} sub-assemblies`)
     
-    return { success: true, data: assemblyToSave }
+    return { success: true, data: subAssemblyData }
   } catch (err) {
-    console.error('Error saving assembly:', err)
+    console.error('Error saving sub-assembly:', err)
     throw err
   }
 })
 
-// Delete an assembly
-ipcMain.handle('assemblies:delete', async (event, assemblyId) => {
+// Delete a sub-assembly
+ipcMain.handle('sub-assemblies:delete', async (event, subAssemblyId) => {
   try {
-    let userAssemblies = await readJSONFile('assemblies.json') || []
-    const initialLength = userAssemblies.length
-    userAssemblies = userAssemblies.filter(a => a.assemblyId !== assemblyId)
-    await writeJSONFile('assemblies.json', userAssemblies)
-    
-    // Refresh the cache
-    cachedAllAssemblies = await getAllAssemblies()
-    console.log(`Assembly deleted and cache refreshed: ${assemblyId}`)
-    
-    return { success: true, changes: initialLength - userAssemblies.length }
+    let userSubAssemblies = await readJSONFile('sub_assemblies.json') || []
+    const initialLength = userSubAssemblies.length
+
+    // Check if this sub-assembly exists in user data (only user-created sub-assemblies can be deleted)
+    const userSubAssembly = userSubAssemblies.find(a =>
+      (a.subAssemblyId || a.assemblyId) === subAssemblyId
+    )
+
+    if (!userSubAssembly) {
+      // This is a bundled sub-assembly that cannot be deleted
+      return { success: false, error: 'Cannot delete bundled sub-assembly. Only user-created sub-assemblies can be deleted.' }
+    }
+
+    // Support both assemblyId and subAssemblyId for deletion
+    userSubAssemblies = userSubAssemblies.filter(a =>
+      (a.subAssemblyId || a.assemblyId) !== subAssemblyId
+    )
+    await writeJSONFile('sub_assemblies.json', userSubAssemblies)
+
+    // Clear the cache to force a fresh load
+    cachedSubAssemblies = []
+    console.log(`Sub-Assembly deleted and cache cleared: ${subAssemblyId}`)
+
+    return { success: true, changes: initialLength - userSubAssemblies.length }
   } catch (err) {
-    console.error('Error deleting assembly:', err)
+    console.error('Error deleting sub-assembly:', err)
     throw err
   }
-})
-
-// Search assemblies by filters
-ipcMain.handle('assemblies:search', async (event, filters) => {
-  let results = cachedAllAssemblies;
+})// Search sub-assemblies by filters
+ipcMain.handle('sub-assemblies:search', async (event, filters) => {
+  let results = cachedSubAssemblies;
 
   if (filters.category) {
     results = results.filter(a => a.category?.toLowerCase().includes(filters.category.toLowerCase()))
@@ -1008,8 +3185,13 @@ ipcMain.handle('assemblies:search', async (event, filters) => {
   if (filters.type) {
     results = results.filter(a => a.attributes?.type?.toLowerCase().includes(filters.type.toLowerCase()))
   }
-  if (filters.assemblyId) {
-    results = results.filter(a => a.assemblyId?.toLowerCase().includes(filters.assemblyId.toLowerCase()))
+  // Support both assemblyId and subAssemblyId for search
+  if (filters.assemblyId || filters.subAssemblyId) {
+    const searchId = (filters.subAssemblyId || filters.assemblyId).toLowerCase()
+    results = results.filter(a => {
+      const id = (a.subAssemblyId || a.assemblyId)?.toLowerCase()
+      return id?.includes(searchId)
+    })
   }
   if (filters.description) {
     results = results.filter(a => a.description?.toLowerCase().includes(filters.description.toLowerCase()))
@@ -1017,11 +3199,11 @@ ipcMain.handle('assemblies:search', async (event, filters) => {
 
   return results
 })
-ipcMain.handle('assemblies:searchMany', async (event, filtersArray) => {
-  const matchingAssemblyIds = new Set();
+ipcMain.handle('sub-assemblies:searchMany', async (event, filtersArray) => {
+  const matchingSubAssemblyIds = new Set();
 
   for (const filters of filtersArray) {
-    let results = cachedAllAssemblies;
+    let results = cachedSubAssemblies;
 
     if (filters.category) {
       results = results.filter(a => a.category?.toLowerCase().includes(filters.category.toLowerCase()))
@@ -1029,56 +3211,42 @@ ipcMain.handle('assemblies:searchMany', async (event, filtersArray) => {
     if (filters.type) {
       results = results.filter(a => a.attributes?.type?.toLowerCase().includes(filters.type.toLowerCase()))
     }
-    if (filters.assemblyId) {
-      results = results.filter(a => a.assemblyId?.toLowerCase().includes(filters.assemblyId.toLowerCase()))
+    // Support both assemblyId and subAssemblyId for search
+    if (filters.assemblyId || filters.subAssemblyId) {
+      const searchId = (filters.subAssemblyId || filters.assemblyId).toLowerCase()
+      results = results.filter(a => {
+        const id = (a.subAssemblyId || a.assemblyId)?.toLowerCase()
+        return id?.includes(searchId)
+      })
     }
     if (filters.description) {
       results = results.filter(a => a.description?.toLowerCase().includes(filters.description.toLowerCase()))
     }
 
-    results.forEach(asm => matchingAssemblyIds.add(asm.assemblyId));
+    results.forEach(asm => {
+      const id = asm.subAssemblyId || asm.assemblyId
+      if (id) matchingSubAssemblyIds.add(id)
+    })
   }
 
-  return Array.from(matchingAssemblyIds);
+  return Array.from(matchingSubAssemblyIds);
 });
 
-// Get assembly by ID
-ipcMain.handle('assemblies:getById', async (event, assemblyId) => {
-  const allAssemblies = await getAllAssemblies();
-  return allAssemblies.find(a => a.assemblyId === assemblyId) || null
+// Get sub-assembly by ID
+ipcMain.handle('sub-assemblies:getById', async (event, subAssemblyId) => {
+  const allAssemblies = await getAllSubAssemblies();
+  // Support both assemblyId and subAssemblyId for lookup
+  return allAssemblies.find(a => (a.subAssemblyId || a.assemblyId) === subAssemblyId) || null
 })
 
-// Expand assembly with full component details and calculate total cost
-ipcMain.handle('assemblies:expand', async (event, assemblyId) => {
-  const allAssemblies = await getAllAssemblies();
-  const assembly = allAssemblies.find(a => a.assemblyId === assemblyId)
-  if (!assembly) return null
-  
-  const expandedComponents = assembly.components.map(ac => {
-    // Trim SKU to handle whitespace issues
-    const trimmedSku = ac.sku?.trim();
-    const component = loadedComponents.find(c => c.sku === trimmedSku);
-    return {
-      ...ac,
-      sku: trimmedSku, // Use trimmed SKU
-      component: component || null,
-      subtotal: component ? (component.price || 0) * ac.quantity : 0
-    }
-  })
-  
-  const totalCost = expandedComponents.reduce((sum, ec) => sum + ec.subtotal, 0)
-  
-  return {
-    ...assembly,
-    components: expandedComponents,
-    totalCost,
-    totalLaborCost: assembly.estimatedLaborHours || 0
-  }
+// Expand sub-assembly with full component details and calculate total cost
+ipcMain.handle('sub-assemblies:expand', async (event, subAssemblyId) => {
+  return await expandSubAssemblyById(subAssemblyId);
 })
 
-// Get unique assembly categories
-ipcMain.handle('assemblies:getCategories', async () => {
-  const allAssemblies = await getAllAssemblies();
+// Get unique sub-assembly categories
+ipcMain.handle('sub-assemblies:getCategories', async () => {
+  const allAssemblies = await getAllSubAssemblies();
   const categories = [...new Set(allAssemblies.map(a => a.category).filter(Boolean))]
   return categories.sort()
 })
@@ -1093,8 +3261,17 @@ ipcMain.handle('quote:save', async (event, quoteObject) => {
   }
   const quotesDir = path.join(dataPath, 'quotes')
   await fs.mkdir(quotesDir, { recursive: true })
-  const filePath = path.join(quotesDir, `${quoteObject.quoteId}.json`)
+  const quoteIdentifier = (quoteObject.quoteId || quoteObject.id || `quote-${Date.now()}`).toString().trim() || `quote-${Date.now()}`
+  const safeQuoteIdentifier = quoteIdentifier.replace(/[\\/:*?"<>|]/g, '_')
+  const filePath = path.join(quotesDir, `${safeQuoteIdentifier}.json`)
   await fs.writeFile(filePath, JSON.stringify(quoteObject, null, 2), 'utf-8')
+
+  try {
+    await writeQuoteSnapshotCSV(quoteObject)
+  } catch (err) {
+    console.error('Failed to write quote snapshot CSV:', err)
+  }
+
   return { success: true, path: filePath }
 })
 
@@ -1143,6 +3320,275 @@ ipcMain.handle('quote:delete', async (event, quoteId) => {
   }
 })
 
+// Evaluate sub-assembly rules from template and quote configuration
+ipcMain.handle('quotes:evaluate-subassembly-rules', async (event, quoteObject) => {
+  try {
+    // Dynamically import service to handle ES module resolution
+    let servicePath
+    if (app.isPackaged) {
+      servicePath = path.join(process.resourcesPath, 'src', 'services', 'SubAssemblyRuleEngine.js')
+    } else {
+      servicePath = path.join(__dirname, '..', 'src', 'services', 'SubAssemblyRuleEngine.js')
+    }
+    
+    // Verify file exists
+    try {
+      await fs.access(servicePath)
+    } catch {
+      throw new Error(`Service file not found: ${servicePath}`)
+    }
+    
+    const serviceURL = pathToFileURL(servicePath).href
+    const { default: SubAssemblyRuleEngine } = await import(serviceURL)
+    
+    // Load template if product code is available
+    let template = null
+    if (quoteObject?.projectCodes?.product) {
+      try {
+        const userTemplatePath = path.join(dataPath, 'product-templates', `${quoteObject.projectCodes.product}.json`)
+        let templatePath = ''
+        
+        try {
+          await fs.access(userTemplatePath)
+          templatePath = userTemplatePath
+        } catch {
+          const srcDir = app.isPackaged
+            ? path.join(process.resourcesPath, 'src')
+            : path.join(__dirname, '..', 'src')
+          const bundledTemplatePath = path.join(srcDir, 'data', 'product-templates', `${quoteObject.projectCodes.product}.json`)
+          
+          try {
+            await fs.access(bundledTemplatePath)
+            templatePath = bundledTemplatePath
+          } catch {
+            // Template not found, continue without it
+          }
+        }
+        
+        if (templatePath) {
+          const data = await fs.readFile(templatePath, 'utf-8')
+          template = JSON.parse(data)
+          
+          // Apply template migration to ensure v2.0 structure
+          let migrationServicePath
+          if (app.isPackaged) {
+            migrationServicePath = path.join(process.resourcesPath, 'src', 'services', 'TemplateMigrationService.js')
+          } else {
+            migrationServicePath = path.join(__dirname, '..', 'src', 'services', 'TemplateMigrationService.js')
+          }
+          
+          try {
+            const migrationURL = pathToFileURL(migrationServicePath).href
+            const { migrateTemplate } = await import(migrationURL)
+            template = migrateTemplate(template)
+          } catch (migrationError) {
+            console.warn('Error migrating template for rule evaluation:', migrationError)
+          }
+        }
+      } catch (err) {
+        console.warn('Error loading template for rule evaluation:', err)
+      }
+    }
+
+    // Evaluate sub-assembly rules
+    const result = SubAssemblyRuleEngine.evaluateSubAssemblyRules(template, quoteObject)
+
+    return {
+      success: true,
+      requiredSubAssemblies: result.requiredSubAssemblies || [],
+      recommendedSubAssemblies: result.recommendedSubAssemblies || []
+    }
+  } catch (error) {
+    console.error('Error evaluating sub-assembly rules:', error)
+    return {
+      success: false,
+      error: error.message,
+      requiredSubAssemblies: [],
+      recommendedSubAssemblies: []
+    }
+  }
+})
+
+// Generate operational items from quote configuration
+ipcMain.handle('quotes:generate-oi', async (event, quoteObject) => {
+  try {
+    // Dynamically import service to handle ES module resolution
+    // Use pathToFileURL for proper file:// URL conversion
+    let servicePath
+    if (app.isPackaged) {
+      // In production, use resources path
+      servicePath = path.join(process.resourcesPath, 'src', 'services', 'BOMGenerationService.js')
+    } else {
+      // In development, use relative path from electron/ directory
+      servicePath = path.join(__dirname, '..', 'src', 'services', 'BOMGenerationService.js')
+    }
+    
+    // Verify file exists
+    try {
+      await fs.access(servicePath)
+    } catch {
+      throw new Error(`Service file not found: ${servicePath}`)
+    }
+    
+    const serviceURL = pathToFileURL(servicePath).href
+    const { default: BOMGenerationService } = await import(serviceURL)
+    
+    // Load all necessary data
+    const allAssemblies = await getAllSubAssemblies()
+    const allComponents = loadedComponents
+    
+    // Load template if product code is available
+    let template = null
+    if (quoteObject?.projectCodes?.product) {
+      try {
+        // Use the same template loading logic as product-templates:get handler
+        // This ensures template migration is applied
+        const userTemplatePath = path.join(dataPath, 'product-templates', `${quoteObject.projectCodes.product}.json`)
+        let templatePath = ''
+        
+        try {
+          await fs.access(userTemplatePath)
+          templatePath = userTemplatePath
+        } catch {
+          // Fall back to bundled templates
+          const srcDir = app.isPackaged
+            ? path.join(process.resourcesPath, 'src')
+            : path.join(__dirname, '..', 'src')
+          const bundledTemplatePath = path.join(srcDir, 'data', 'product-templates', `${quoteObject.projectCodes.product}.json`)
+          
+          try {
+            await fs.access(bundledTemplatePath)
+            templatePath = bundledTemplatePath
+          } catch {
+            // Template not found, continue without it
+          }
+        }
+        
+        if (templatePath) {
+          const data = await fs.readFile(templatePath, 'utf-8')
+          template = JSON.parse(data)
+          
+          // Apply template migration to ensure v2.0 structure
+          let migrationServicePath
+          if (app.isPackaged) {
+            migrationServicePath = path.join(process.resourcesPath, 'src', 'services', 'TemplateMigrationService.js')
+          } else {
+            migrationServicePath = path.join(__dirname, '..', 'src', 'services', 'TemplateMigrationService.js')
+          }
+          
+          try {
+            const migrationURL = pathToFileURL(migrationServicePath).href
+            const { migrateTemplate } = await import(migrationURL)
+            template = migrateTemplate(template)
+          } catch (migrationError) {
+            console.warn('Error migrating template for OI generation:', migrationError)
+            // Continue with unmigrated template (may cause issues, but better than crashing)
+          }
+        }
+      } catch (err) {
+        console.warn('Error loading template for OI generation:', err)
+      }
+    }
+
+    // Generate operational items
+    const operationalItems = BOMGenerationService.generateOperationalItems(
+      quoteObject,
+      allAssemblies,
+      allComponents,
+      template
+    )
+
+    return {
+      success: true,
+      operationalItems
+    }
+  } catch (error) {
+    console.error('Error generating operational items:', error)
+    return {
+      success: false,
+      error: error.message,
+      operationalItems: []
+    }
+  }
+})
+
+// Validate quote configuration
+ipcMain.handle('quotes:validate', async (event, quoteObject) => {
+  try {
+    // Dynamically import service to handle ES module resolution
+    // Use pathToFileURL for proper file:// URL conversion
+    let servicePath
+    if (app.isPackaged) {
+      servicePath = path.join(process.resourcesPath, 'src', 'services', 'ValidationService.js')
+    } else {
+      servicePath = path.join(__dirname, '..', 'src', 'services', 'ValidationService.js')
+    }
+    
+    // Verify file exists
+    try {
+      await fs.access(servicePath)
+    } catch {
+      throw new Error(`Service file not found: ${servicePath}`)
+    }
+    
+    const serviceURL = pathToFileURL(servicePath).href
+    const { default: ValidationService } = await import(serviceURL)
+    
+    // Load all necessary data
+    const allAssemblies = await getAllSubAssemblies()
+    const allComponents = loadedComponents
+    
+    // Load template if product code is available
+    let template = null
+    if (quoteObject?.projectCodes?.product) {
+      try {
+        const userFilePath = path.join(dataPath, 'product-templates', `${quoteObject.projectCodes.product}.json`)
+        try {
+          const data = await fs.readFile(userFilePath, 'utf-8')
+          template = JSON.parse(data)
+        } catch {
+          // Try source directory
+          let filePath
+          if (app.isPackaged) {
+            filePath = path.join(process.resourcesPath, 'data', 'product-templates', `${quoteObject.projectCodes.product}.json`)
+          } else {
+            filePath = path.join(__dirname, '..', 'src', 'data', 'product-templates', `${quoteObject.projectCodes.product}.json`)
+          }
+          try {
+            const data = await fs.readFile(filePath, 'utf-8')
+            template = JSON.parse(data)
+          } catch {
+            // Template not found
+          }
+        }
+      } catch (err) {
+        console.warn('Error loading template for validation:', err)
+      }
+    }
+
+    // Validate quote configuration
+    const validationErrors = ValidationService.validateQuoteConfiguration(
+      quoteObject,
+      template,
+      allAssemblies,
+      allComponents
+    )
+
+    return {
+      success: true,
+      validationErrors
+    }
+  } catch (error) {
+    console.error('Error validating quote:', error)
+    return {
+      success: false,
+      error: error.message,
+      validationErrors: []
+    }
+  }
+})
+
+
 // Schemas IPC handlers
 
 ipcMain.handle('schemas:getIndustry', async () => {
@@ -1151,7 +3597,7 @@ ipcMain.handle('schemas:getIndustry', async () => {
     if (process.env.NODE_ENV === 'development' || !app.isPackaged) {
       schemaPath = path.join(__dirname, '..', 'src', 'data', 'quotes', 'project_quote_schema.json');
     } else {
-      schemaPath = path.join(process.resourcesPath, 'data', 'quotes', 'project_quote_schema.json');
+      schemaPath = path.join(process.resourcesPath, 'app.asar', 'src', 'data', 'quotes', 'project_quote_schema.json');
     }
     
     const data = await fs.readFile(schemaPath, 'utf-8');
@@ -1182,7 +3628,7 @@ ipcMain.handle('schemas:getProduct', async () => {
     if (process.env.NODE_ENV === 'development' || !app.isPackaged) {
       schemaPath = path.join(__dirname, '..', 'src', 'data', 'quotes', 'project_quote_schema.json');
     } else {
-      schemaPath = path.join(process.resourcesPath, 'data', 'quotes', 'project_quote_schema.json');
+      schemaPath = path.join(process.resourcesPath, 'app.asar', 'src', 'data', 'quotes', 'project_quote_schema.json');
     }
     
     console.log('Loading product schema from:', schemaPath);
@@ -1218,7 +3664,7 @@ ipcMain.handle('schemas:getControl', async () => {
     if (process.env.NODE_ENV === 'development' || !app.isPackaged) {
       schemaPath = path.join(__dirname, '..', 'src', 'data', 'quotes', 'project_quote_schema.json');
     } else {
-      schemaPath = path.join(process.resourcesPath, 'data', 'quotes', 'project_quote_schema.json');
+      schemaPath = path.join(process.resourcesPath, 'app.asar', 'src', 'data', 'quotes', 'project_quote_schema.json');
     }
     
     const data = await fs.readFile(schemaPath, 'utf-8');
@@ -1248,7 +3694,7 @@ ipcMain.handle('schemas:getScope', async () => {
     if (process.env.NODE_ENV === 'development' || !app.isPackaged) {
       schemaPath = path.join(__dirname, '..', 'src', 'data', 'quotes', 'project_quote_schema.json');
     } else {
-      schemaPath = path.join(process.resourcesPath, 'data', 'quotes', 'project_quote_schema.json');
+      schemaPath = path.join(process.resourcesPath, 'app.asar', 'src', 'data', 'quotes', 'project_quote_schema.json');
     }
     
     const data = await fs.readFile(schemaPath, 'utf-8');
@@ -1321,7 +3767,7 @@ ipcMain.handle('schemas:get-product', async () => {
     if (process.env.NODE_ENV === 'development' || !app.isPackaged) {
       schemaPath = path.join(__dirname, '..', 'src', 'data', 'quotes', 'project_quote_schema.json');
     } else {
-      schemaPath = path.join(process.resourcesPath, 'data', 'quotes', 'project_quote_schema.json');
+      schemaPath = path.join(process.resourcesPath, 'app.asar', 'src', 'data', 'quotes', 'project_quote_schema.json');
     }
     
     const data = await fs.readFile(schemaPath, 'utf-8');
@@ -1340,6 +3786,53 @@ ipcMain.handle('schemas:get-product', async () => {
     return MOCK_PRODUCT_SCHEMA; // Fallback to mock data
   }
 });
+
+// Add product handler with hyphenated name
+ipcMain.handle('schemas:add-product', async (event, productData) => {
+  try {
+    let schemaPath;
+    if (process.env.NODE_ENV === 'development' || !app.isPackaged) {
+      schemaPath = path.join(__dirname, '..', 'src', 'data', 'quotes', 'project_quote_schema.json');
+    } else {
+      schemaPath = path.join(process.resourcesPath, 'app.asar', 'src', 'data', 'quotes', 'project_quote_schema.json');
+    }
+    
+    // Read current schema
+    const data = await fs.readFile(schemaPath, 'utf-8');
+    const schema = JSON.parse(data);
+    
+    // Get current product list
+    const productCodes = schema.properties?.projectCodes?.properties?.product?.oneOf || [];
+    
+    // Check if product already exists
+    if (productCodes.find(p => p.const === productData.const)) {
+      return { success: false, error: 'Product code already exists' };
+    }
+    
+    // Add new product
+    productCodes.push({
+      const: productData.const,
+      description: productData.description
+    });
+    
+    // Sort by const value
+    productCodes.sort((a, b) => a.const - b.const);
+    
+    // Update schema
+    schema.properties.projectCodes.properties.product.oneOf = productCodes;
+    
+    // Write back to file
+    await fs.writeFile(schemaPath, JSON.stringify(schema, null, 2), 'utf-8');
+    
+    console.log(`[Schema] Added new product: ${productData.const} - ${productData.description}`);
+    
+    return { success: true };
+  } catch (err) {
+    console.error('Error adding product to schema:', err);
+    return { success: false, error: err.message };
+  }
+});
+
 ipcMain.handle('schemas:get-control', () => { return MOCK_CONTROL_SCHEMA; });
 ipcMain.handle('schemas:get-scope', () => { return MOCK_SCOPE_SCHEMA; });
 
@@ -1425,38 +3918,187 @@ const MOCK_CUSTOMERS = Object.entries(DEFAULT_CUSTOMER_DATA).map(([id, name]) =>
 
 ipcMain.handle('customers:get-all', () => { return MOCK_CUSTOMERS; });
 
+// Add customer
+ipcMain.handle('customers:add', async (event, { name, isOEM }) => {
+  try {
+    // Load existing custom customers
+    const settings = await readJSONFile('settings.json') || {}
+    const customCustomerData = settings.customCustomers ? JSON.parse(settings.customCustomers) : {}
+    const allCustomers = { ...DEFAULT_CUSTOMER_DATA, ...customCustomerData }
+    
+    // Determine the next available number
+    const existingIds = Object.keys(allCustomers).map(id => parseInt(id))
+    const rangeStart = isOEM ? 0 : 100
+    const rangeEnd = isOEM ? 99 : 999
+    
+    let nextId = rangeStart
+    for (let i = rangeStart; i <= rangeEnd; i++) {
+      if (!existingIds.includes(i)) {
+        nextId = i
+        break
+      }
+    }
+    
+    // Validate we found an available ID
+    if (nextId > rangeEnd) {
+      throw new Error(`No available ${isOEM ? 'OEM' : 'End User'} customer numbers`)
+    }
+    
+    const customerId = String(nextId).padStart(3, '0')
+    
+    // Add to custom customers
+    customCustomerData[customerId] = name
+    settings.customCustomers = JSON.stringify(customCustomerData)
+    
+    // Save to settings.json
+    await writeJSONFile('settings.json', settings)
+    
+    // Log customer creation using LoggingService
+    // Import LoggingService dynamically to avoid circular dependencies
+    let loggingService;
+    try {
+      const loggingServicePath = path.join(__dirname, '..', 'src', 'services', 'LoggingService.js');
+      const loggingServiceURL = pathToFileURL(loggingServicePath).href;
+      const { default: LoggingService } = await import(loggingServiceURL);
+      loggingService = LoggingService;
+      loggingService.logCustomerActivity('create', customerId, name, {
+        type: isOEM ? 'OEM' : 'End User',
+        source: 'settings_ui'
+      });
+    } catch (logError) {
+      console.error('Error logging customer creation:', logError);
+    }
+    
+    return { id: customerId, name, isOEM }
+  } catch (err) {
+    console.error('Error adding customer:', err)
+    throw err
+  }
+});
+
+// Delete customer
+ipcMain.handle('customers:delete', async (event, customerId) => {
+  try {
+    const settings = await readJSONFile('settings.json') || {}
+    const customCustomerData = settings.customCustomers ? JSON.parse(settings.customCustomers) : {}
+    
+    // Only allow deletion of custom customers (not defaults)
+    if (!customCustomerData[customerId]) {
+      throw new Error('Cannot delete default customer')
+    }
+    
+    delete customCustomerData[customerId]
+    settings.customCustomers = JSON.stringify(customCustomerData)
+    
+    await writeJSONFile('settings.json', settings)
+    return { success: true }
+  } catch (err) {
+    console.error('Error deleting customer:', err)
+    throw err
+  }
+});
+
+// Update customer
+ipcMain.handle('customers:update', async (event, { id, name }) => {
+  try {
+    const settings = await readJSONFile('settings.json') || {}
+    const customCustomerData = settings.customCustomers ? JSON.parse(settings.customCustomers) : {}
+    
+    // Only allow updating custom customers
+    if (!customCustomerData[id]) {
+      throw new Error('Cannot update default customer')
+    }
+    
+    customCustomerData[id] = name
+    settings.customCustomers = JSON.stringify(customCustomerData)
+    
+    await writeJSONFile('settings.json', settings)
+    return { id, name }
+  } catch (err) {
+    console.error('Error updating customer:', err)
+    throw err
+  }
+});
+
 // Product Templates IPC handlers
 
 // Get product template by product code
 ipcMain.handle('product-templates:get', async (event, productCode) => {
+  if (!productCode) {
+    return null;
+  }
+
+  let templatePath = '';
+  let template = null;
+
   try {
-    // Try user data directory FIRST (for custom/modified templates)
-    const userFilePath = path.join(dataPath, 'product-templates', `${productCode}.json`);
-    
+    // 1. Check user's custom templates directory first
+    const userTemplatePath = path.join(dataPath, 'product-templates', `${productCode}.json`);
     try {
-      const data = await fs.readFile(userFilePath, 'utf-8');
-      return JSON.parse(data);
-    } catch (userErr) {
-      // If not in user data, try source directory (for built-in templates)
-      if (userErr.code === 'ENOENT') {
-        let filePath;
-        if (app.isPackaged) {
-          filePath = path.join(process.resourcesPath, 'data', 'product-templates', `${productCode}.json`);
-        } else {
-          filePath = path.join(__dirname, '..', 'src', 'data', 'product-templates', `${productCode}.json`);
-        }
+      await fs.access(userTemplatePath);
+      templatePath = userTemplatePath;
+    } catch (err) {
+      // 2. If not found, fall back to bundled templates
+      const srcDir = app.isPackaged
+        ? path.join(process.resourcesPath, 'src') // Packaged
+        : path.join(__dirname, '..', 'src');     // Development
         
-        const data = await fs.readFile(filePath, 'utf-8');
-        return JSON.parse(data);
+      const bundledTemplatePath = path.join(srcDir, 'data', 'product-templates', `${productCode}.json`);
+      
+      try {
+        await fs.access(bundledTemplatePath);
+        templatePath = bundledTemplatePath;
+      } catch (err2) {
+        console.warn(`No template file found for product code: ${productCode}`);
+        return null;
       }
-      throw userErr;
     }
-  } catch (err) {
-    if (err.code === 'ENOENT') {
+
+    // Read the template file
+    const data = await fs.readFile(templatePath, 'utf8');
+    if (data) {
+      template = JSON.parse(data);
+
+      // --- [NEW] V2.0 MIGRATION LOGIC ---
+      if (template) {
+        // Define path to the migration service
+        let migrationServicePath;
+        if (app.isPackaged) {
+          migrationServicePath = path.join(process.resourcesPath, 'src', 'services', 'TemplateMigrationService.js');
+        } else {
+          migrationServicePath = path.join(__dirname, '..', 'src', 'services', 'TemplateMigrationService.js');
+        }
+
+        // Convert path to file URL for ES module import
+        const serviceURL = pathToFileURL(migrationServicePath).href;
+        
+        try {
+          // Import
+          const { migrateTemplate } = await import(serviceURL);
+          
+          // Auto-migrate the template to the v2.0 structure in memory
+          const migratedTemplate = migrateTemplate(template);
+          
+          // Return the migrated, v2.0 compatible template to the UI
+          return migratedTemplate;
+        } catch (importError) {
+          console.error('Error importing TemplateMigrationService:', importError);
+          // If migration fails, return original template (better than crashing)
+          return template;
+        }
+      }
+      // --- END OF MIGRATION LOGIC ---
+    }
+    
+    // Fallback (should not be reached if migration is successful)
+    return template;
+    
+  } catch (error) {
+    if (error.code === 'ENOENT') {
       return null; // Template doesn't exist
     }
-    console.error('Error loading product template:', err);
-    throw err;
+    console.error(`Error loading product template ${productCode}:`, error);
+    return null;
   }
 })
 
@@ -1468,7 +4110,7 @@ ipcMain.handle('product-templates:save', async (event, templateObject) => {
     if (process.env.NODE_ENV === 'development' || !app.isPackaged) {
       templateSchemaPath = path.join(__dirname, '..', 'src', 'data', 'schemas', 'product_template_schema.json')
     } else {
-      templateSchemaPath = path.join(process.resourcesPath, 'data', 'schemas', 'product_template_schema.json')
+      templateSchemaPath = path.join(process.resourcesPath, 'app.asar', 'src', 'data', 'schemas', 'product_template_schema.json')
     }
     
     const schemaData = await fs.readFile(templateSchemaPath, 'utf-8')
@@ -1545,7 +4187,7 @@ ipcMain.handle('boms:save', async (event, bomToSave) => {
     if (process.env.NODE_ENV === 'development' || !app.isPackaged) {
       bomSchemaPath = path.join(__dirname, '..', 'src', 'data', 'schemas', 'manual_bom_schema.json')
     } else {
-      bomSchemaPath = path.join(process.resourcesPath, 'data', 'schemas', 'manual_bom_schema.json')
+      bomSchemaPath = path.join(process.resourcesPath, 'app.asar', 'src', 'data', 'schemas', 'manual_bom_schema.json')
     }
     
     const schemaData = await fs.readFile(bomSchemaPath, 'utf-8')
@@ -1585,30 +4227,42 @@ ipcMain.handle('boms:save', async (event, bomToSave) => {
   }
 })
 
-ipcMain.handle('boms:expand-bom', async (event, { assemblies, components }) => {
+ipcMain.handle('boms:expand-bom', async (event, payload = {}) => {
   try {
+    const subAssemblyItems = Array.isArray(payload?.subAssemblies) && payload.subAssemblies.length > 0
+      ? payload.subAssemblies
+      : Array.isArray(payload?.assemblies)
+        ? payload.assemblies
+        : [];
+    const componentItems = Array.isArray(payload?.components) ? payload.components : [];
     let totalCost = 0
     
-    // Expand assemblies
-    for (const item of assemblies) {
-      const assemblyId = item.assemblyId
-      const quantity = item.quantity
-      
-      // Use the existing assemblies:expand logic
-      const expansion = await expandAssembly(assemblyId)
-      if (expansion && expansion.componentCost !== undefined) {
-        totalCost += expansion.componentCost * quantity
+    // Expand sub-assemblies
+    for (const item of subAssemblyItems) {
+      const subAssemblyId = item?.subAssemblyId || item?.assemblyId
+      const quantity = Number(item?.quantity) || 0
+
+      if (!subAssemblyId || quantity <= 0) {
+        continue
+      }
+
+      const expansion = await expandSubAssemblyById(subAssemblyId)
+      if (expansion && typeof expansion.totalCost === 'number') {
+        totalCost += expansion.totalCost * quantity
       }
     }
     
     // Expand components
-    for (const item of components) {
-      const sku = item.sku
-      const quantity = item.quantity
-      
-      // Get component price
-      const component = await getComponentBySku(sku)
-      if (component && component.price !== undefined) {
+    for (const item of componentItems) {
+      const sku = item?.sku?.trim()
+      const quantity = Number(item?.quantity) || 0
+
+      if (!sku || quantity <= 0) {
+        continue
+      }
+
+      const component = loadedComponents.find(c => c.sku === sku)
+      if (component && typeof component.price === 'number') {
         totalCost += component.price * quantity
       }
     }
@@ -1629,13 +4283,44 @@ ipcMain.handle('app:show-open-dialog', async (event, options) => {
 
 // Read file
 ipcMain.handle('app:read-file', async (event, filePath) => {
-  return fs.readFile(filePath, 'utf-8')
+  const fullPath = await resolveRuntimePathWithCredentials(filePath, mainWindow)
+
+  if (resolvedRuntimeRoot) {
+    console.log(`[app:read-file] overridden root => ${fullPath}`)
+  }
+
+  return fs.readFile(fullPath, 'utf-8')
 })
 
 // Write file
 ipcMain.handle('app:write-file', async (event, filePath, content) => {
-  const fullPath = path.join(__dirname, '..', filePath)
+  const fullPath = await resolveRuntimePathWithCredentials(filePath, mainWindow)
+  await ensureDirectoryForFile(fullPath)
+
+  if (resolvedRuntimeRoot) {
+    console.log(`[app:write-file] overridden root => ${fullPath}`)
+  }
+
   return fs.writeFile(fullPath, content, 'utf-8')
+})
+
+ipcMain.handle('app:log-margin-calculation', async (event, marginData) => {
+  await logMarginCalculation(marginData)
+})
+
+ipcMain.handle('runtime:get-status', async () => {
+  try {
+    return await getRuntimeStatus()
+  } catch (err) {
+    console.error('Failed to resolve runtime status:', err)
+    return {
+      runtimeRoot: await resolveRuntimePath(),
+      usingOverride: Boolean(resolvedRuntimeRoot),
+      ok: false,
+      message: `Failed to resolve runtime status: ${err.message}`,
+      error: err.message
+    }
+  }
 })
 
 // Pipedrive IPC handlers
@@ -1689,6 +4374,58 @@ ipcMain.handle('api:get-plugin-registry', async () => {
   } catch (err) {
     console.error('Error loading plugin registry:', err);
     return [];
+  }
+});
+
+ipcMain.handle('api:get-toolbox-manifest', async () => {
+  try {
+    // Read toolbox manifest from public/toolbox directory
+    const manifestPath = isDev 
+      ? path.join(__dirname, '..', 'public', 'toolbox', 'manifest.json')
+      : path.join(process.resourcesPath, 'app.asar', 'dist', 'toolbox', 'manifest.json');
+    console.log('Reading toolbox manifest from:', manifestPath);
+    const data = await fs.readFile(manifestPath, 'utf-8');
+    const manifest = JSON.parse(data);
+    console.log('Loaded toolbox manifest:', manifest.length, 'tools');
+    return manifest || [];
+  } catch (err) {
+    console.error('Error loading toolbox manifest:', err);
+    return [];
+  }
+});
+
+ipcMain.handle('api:get-tool-file-url', async (event, relativePath) => {
+  try {
+    // Convert relative paths like /toolbox/file.html to file:// URLs
+    if (relativePath.startsWith('/toolbox/')) {
+      const fileName = relativePath.replace('/toolbox/', '');
+      const filePath = isDev 
+        ? path.join(__dirname, '..', 'public', 'toolbox', fileName)
+        : path.join(process.resourcesPath, 'app.asar', 'dist', 'toolbox', fileName);
+      
+      // Check if file exists
+      await fs.access(filePath);
+      
+      // Return file:// URL
+      return 'file://' + filePath;
+    }
+    return relativePath;
+  } catch (err) {
+    console.error('Error getting tool file URL:', err);
+    return relativePath;
+  }
+});
+
+ipcMain.handle('api:get-logo-url', async () => {
+  const filePath = isDev 
+    ? path.join(__dirname, '..', 'public', 'Craft_Logo.png')
+    : path.join(process.resourcesPath, 'app.asar', 'dist', 'Craft_Logo.png');
+  try {
+    await fs.access(filePath);
+    return 'file://' + filePath;
+  } catch (err) {
+    console.error('Error getting logo URL:', err);
+    return '/Craft_Logo.png'; // fallback
   }
 });
 
@@ -1841,14 +4578,22 @@ ipcMain.handle('api:load-plugin', async (event, pluginId, context) => {
 // Shell API handlers
 
 ipcMain.handle('shell:open-external', async (event, url) => {
-  const { shell } = require('electron');
-  shell.openExternal(url);
-  return { success: true };
+  try {
+    await shell.openExternal(url);
+    return { success: true };
+  } catch (error) {
+    console.error('Error opening external URL:', error);
+    return { success: false, error: error.message };
+  }
 });
 
 // Manual Management System
 const MANUALS_DIR = path.join(app.getPath('userData'), 'ComponentManuals');
 const MANUALS_INDEX = path.join(app.getPath('userData'), 'data', 'manual_index.json');
+
+function resolveManualKey(source = {}) {
+  return source.sku || source.vndrnum || source.id || null;
+}
 
 // Ensure manuals directory exists
 async function ensureManualsDir() {
@@ -1878,19 +4623,20 @@ async function saveManualIndex(index) {
 
 // Generate smart search URLs for manufacturers
 function generateSearchUrls(component) {
-  const { sku, manufacturer, vndrnum, description } = component;
+  const { sku, manufacturer, vndrnum } = component;
+  const partNumber = vndrnum || sku || '';
   const man = (manufacturer || '').toLowerCase();
   
   // Manufacturer-specific search URLs
   const manufacturerUrls = {
-    'allen bradley': `https://literature.rockwellautomation.com/idc/groups/literature/documents/um/${sku || vndrnum}/en-us.pdf`,
-    'rockwell': `https://literature.rockwellautomation.com/idc/groups/literature/documents/um/${sku || vndrnum}/en-us.pdf`,
-    'siemens': `https://support.industry.siemens.com/cs/ww/en/ps/${sku || vndrnum}/man`,
-    'schneider': `https://www.se.com/ww/en/search.html?q=${sku || vndrnum}+manual`,
-    'abb': `https://search.abb.com/library/Download.aspx?DocumentID=${sku || vndrnum}`,
-    'endress+hauser': `https://portal.endress.com/wa001/dla/5000000/${sku || vndrnum}.pdf`,
-    'endress hauser': `https://portal.endress.com/wa001/dla/5000000/${sku || vndrnum}.pdf`,
-    'festo': `https://www.festo.com/cat/${sku || vndrnum}`,
+    'allen bradley': 'https://literature.rockwellautomation.com/idc/groups/literature/documents/um/' + partNumber + '/en-us.pdf',
+    'rockwell': 'https://literature.rockwellautomation.com/idc/groups/literature/documents/um/' + partNumber + '/en-us.pdf',
+    'siemens': 'https://support.industry.siemens.com/cs/ww/en/ps/' + partNumber + '/man',
+    'schneider': 'https://www.se.com/ww/en/search.html?q=' + encodeURIComponent(partNumber) + '+manual',
+    'abb': 'https://search.abb.com/library/Download.aspx?DocumentID=' + partNumber,
+    'endress+hauser': 'https://portal.endress.com/wa001/dla/5000000/' + partNumber + '.pdf',
+    'endress hauser': 'https://portal.endress.com/wa001/dla/5000000/' + partNumber + '.pdf',
+    'festo': 'https://www.festo.com/cat/' + partNumber,
   };
   
   // Check if we have a specific manufacturer URL
@@ -1901,8 +4647,9 @@ function generateSearchUrls(component) {
   }
   
   // Fallback to Google search with specific terms
-  const searchTerm = encodeURIComponent(`${manufacturer} ${sku || vndrnum} manual pdf`);
-  return `https://www.google.com/search?q=${searchTerm}`;
+  const numberHint = partNumber || sku || '';
+  const searchTerm = encodeURIComponent((manufacturer || '') + ' ' + numberHint + ' manual pdf'.trim());
+  return 'https://www.google.com/search?q=' + searchTerm;
 }
 
 // Manual System IPC Handlers
@@ -1912,16 +4659,26 @@ ipcMain.handle('manuals:check-local', async (event, component) => {
     await ensureManualsDir();
     const index = await loadManualIndex();
     
-    const key = component.sku || component.id;
-    if (index[key] && index[key].localPath) {
-      // Check if file actually exists
-      try {
-        await fs.access(index[key].localPath);
-        return { found: true, path: index[key].localPath };
-      } catch {
-        // File was deleted, remove from index
-        delete index[key];
-        await saveManualIndex(index);
+    const key = resolveManualKey(component);
+    if (!key) {
+      return { found: false };
+    }
+    const entry = index[key];
+    if (entry) {
+      if (entry.localPath) {
+        // Check if file actually exists
+        try {
+          await fs.access(entry.localPath);
+          return { found: true, path: entry.localPath, type: 'local' };
+        } catch {
+          // File was deleted, remove the stale path reference
+          delete entry.localPath;
+          await saveManualIndex(index);
+        }
+      }
+
+      if (entry.manualUrl) {
+        return { found: true, url: entry.manualUrl, type: 'reference' };
       }
     }
     
@@ -1933,7 +4690,6 @@ ipcMain.handle('manuals:check-local', async (event, component) => {
 });
 
 ipcMain.handle('manuals:open-local', async (event, filePath) => {
-  const { shell } = require('electron');
   try {
     await shell.openPath(filePath);
     return { success: true };
@@ -1958,11 +4714,16 @@ ipcMain.handle('manuals:save-reference', async (event, data) => {
     await ensureManualsDir();
     const index = await loadManualIndex();
     
-    const key = data.sku;
+    const key = resolveManualKey(data);
+    if (!key) {
+      throw new Error('Unable to resolve manual key (missing SKU/VNDRNUM/ID)');
+    }
     index[key] = {
       manufacturer: data.manufacturer,
       manualUrl: data.manualUrl,
       savedDate: data.savedDate,
+      sku: data.sku || null,
+      vndrnum: data.vndrnum || null,
       // Future: could store actual PDF path here when we implement download
       localPath: null
     };
@@ -1987,12 +4748,12 @@ ipcMain.handle('manuals:get-index', async () => {
 // Helper function to log number generation to CSV
 async function logNumberGeneration(type, numberData) {
   try {
-    const outputDir = path.join(app.getPath('userData'), 'OUTPUT');
-    const csvPath = path.join(outputDir, 'number_log.csv');
-    
-    // Ensure OUTPUT directory exists
-    await fs.mkdir(outputDir, { recursive: true });
-    
+    const logsDir = await resolveRuntimePathWithCredentials('OUTPUT/LOGS', mainWindow);
+    const csvPath = path.join(logsDir, `${type}Numbers.csv`);
+
+    // Ensure LOGS directory exists
+    await ensureDirectoryForFile(csvPath);
+
     // Create CSV header if file doesn't exist
     let fileExists = false;
     try {
@@ -2001,23 +4762,63 @@ async function logNumberGeneration(type, numberData) {
     } catch (error) {
       // File doesn't exist, will create with header
     }
-    
+
     const timestamp = new Date().toISOString();
-    const row = `"${timestamp}","${type}","${numberData.mainId}","${numberData.fullId}","${numberData.customerCode}","${numberData.customerName || ''}"`;
-    
+    const row = `"${timestamp}","${numberData.mainId}","${numberData.fullId}","${numberData.customerCode}","${numberData.customerName || ''}","${numberData.industry || ''}","${numberData.product || ''}","${numberData.control || ''}","${numberData.scope || ''}","${numberData.poNumber || ''}"`;
+
     if (!fileExists) {
-      const header = '"Timestamp","Type","Main ID","Full ID","Customer Code","Customer Name"';
+      const header = '"Timestamp","Main ID","Full ID","Customer Code","Customer Name","Industry","Product","Control","Scope","PO Number"';
       await fs.writeFile(csvPath, header + '\n' + row + '\n', 'utf8');
+      console.log(`[${type} Number Log] Created new log file: ${csvPath}`);
     } else {
       await fs.appendFile(csvPath, row + '\n', 'utf8');
     }
+    
+    console.log(`[${type} Number Log] Generated: ${numberData.fullId} for customer ${numberData.customerName} (${numberData.customerCode})`);
   } catch (error) {
     console.error('Error logging number generation:', error);
   }
 }
 
+// Helper function to log margin calculations
+async function logMarginCalculation(marginData) {
+  try {
+    const logsDir = await resolveRuntimePathWithCredentials('OUTPUT/LOGS', mainWindow);
+    const csvPath = path.join(logsDir, 'Margin.csv');
+
+    // Ensure LOGS directory exists
+    await ensureDirectoryForFile(csvPath);
+
+    // Create CSV header if file doesn't exist
+    let fileExists = false;
+    try {
+      await fs.access(csvPath);
+      fileExists = true;
+    } catch (error) {
+      // File doesn't exist, will create with header
+    }
+
+    const timestamp = new Date().toISOString();
+    const row = `"${timestamp}","${marginData.quoteId || ''}","${marginData.materialCost || 0}","${marginData.laborCost || 0}","${marginData.totalCOGS || 0}","${marginData.marginPercent || 0}","${marginData.finalPrice || 0}","${marginData.user || ''}"`;
+
+    if (!fileExists) {
+      const header = '"Timestamp","Quote ID","Material Cost","Labor Cost","Total COGS","Margin %","Final Price","User"';
+      await fs.writeFile(csvPath, header + '\n' + row + '\n', 'utf8');
+    } else {
+      await fs.appendFile(csvPath, row + '\n', 'utf8');
+    }
+  } catch (error) {
+    console.error('Error logging margin calculation:', error);
+  }
+}
+
 // Quote Number Generator IPC handler
 ipcMain.handle('calc:get-quote-number', async (event, data) => {
+  console.log('🔢 [Quote Number Generator] Starting quote number generation...');
+  console.log('   Input data:', JSON.stringify(data, null, 2));
+  console.log('   serverDb available:', !!serverDb);
+  console.log('   generatedNumbersDb available:', !!generatedNumbersDb);
+  
   const now = new Date();
   const yy = now.getFullYear().toString().slice(-2);
   const mm = (now.getMonth() + 1).toString().padStart(2, '0');
@@ -2028,14 +4829,103 @@ ipcMain.handle('calc:get-quote-number', async (event, data) => {
   const mainId = `CA${yy}${mm}${dd}${cust}`;
   const fullId = `${mainId}-${data.industry || 'XX'}${data.product || 'XXX'}${data.control || 'X'}${data.scope || 'XX'}-${seq}`;
   
-  // Log to CSV
-  const customerName = DEFAULT_CUSTOMER_DATA[cust] || '';
-  await logNumberGeneration('Quote', { mainId, fullId, customerCode: cust, customerName });
+  console.log('   Generated IDs: mainId="' + mainId + '", fullId="' + fullId + '"');
   
-  return { mainId, fullId };
+  // Get customer name from DEFAULT_CUSTOMER_DATA or custom customers
+  let customerName = DEFAULT_CUSTOMER_DATA[cust] || '';
+  if (!customerName) {
+    try {
+      const customersPath = path.join(dataPath, 'customers', 'customers.json');
+      const customersData = await fs.readFile(customersPath, 'utf-8');
+      const customCustomers = JSON.parse(customersData);
+      const customer = customCustomers.find(c => c.id === cust);
+      customerName = customer ? customer.name : 'Unknown';
+    } catch (error) {
+      console.warn('   Could not load custom customers:', error.message);
+      customerName = 'Unknown';
+    }
+  }
+  
+  console.log('   Customer: "' + customerName + '" (' + cust + ')');
+  
+  // Log to CSV with full details
+  console.log('   Logging to CSV...');
+  try {
+    await logNumberGeneration('Quote', { 
+      mainId, 
+      fullId, 
+      customerCode: cust, 
+      customerName,
+      industry: data.industry,
+      product: data.product,
+      control: data.control,
+      scope: data.scope
+    });
+    console.log('   ✅ CSV logging completed');
+  } catch (error) {
+    console.error('   ❌ CSV logging failed:', error);
+  }
+
+  // Store in main database
+  console.log('   Storing in main database...');
+  try {
+    if (serverDb) {
+      const now = new Date().toISOString();
+      await serverDb.run(`
+        INSERT INTO generated_numbers (
+          type, mainId, fullId, customerCode, customerName,
+          industry, product, control, scope, generated_at, updated_at, updated_by
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        'quote', mainId, fullId, cust, customerName,
+        data.industry || null, data.product || null, data.control || null, data.scope || null,
+        now, now, 'system'
+      ]);
+      console.log('   ✅ Stored in main database (serverDb)');
+    } else {
+      console.warn('   ⚠️ serverDb not available, skipping main database storage');
+    }
+  } catch (error) {
+    console.error('   ❌ Error storing quote number in main database:', error);
+    console.error('      Error code:', error.code);
+    console.error('      Error message:', error.message);
+  }
+
+  // Store in generated numbers database
+  console.log('   Storing in generated numbers database...');
+  try {
+    if (generatedNumbersDb) {
+      const now = new Date().toISOString();
+      await generatedNumbersDb.run(`
+        INSERT INTO generated_numbers (
+          type, mainId, fullId, customerCode, customerName,
+          industry, product, control, scope, generated_at, updated_at, updated_by
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        'quote', mainId, fullId, cust, customerName,
+        data.industry || null, data.product || null, data.control || null, data.scope || null,
+        now, now, 'system'
+      ]);
+      console.log('   ✅ Stored in generated numbers database (generatedNumbersDb)');
+    } else {
+      console.warn('   ⚠️ generatedNumbersDb not available, skipping separate database storage');
+    }
+  } catch (error) {
+    console.error('   ❌ Error storing quote number in generated numbers database:', error);
+    console.error('      Error code:', error.code);
+    console.error('      Error message:', error.message);
+  }
+
+  console.log('🔢 [Quote Number Generator] Completed successfully');
+  return { mainId, fullId, customerName };
 });
 
 ipcMain.handle('calc:get-project-number', async (event, data) => {
+  console.log('🔢 [Project Number Generator] Starting project number generation...');
+  console.log('   Input data:', JSON.stringify(data, null, 2));
+  console.log('   serverDb available:', !!serverDb);
+  console.log('   generatedNumbersDb available:', !!generatedNumbersDb);
+  
   const now = new Date();
   const yy = now.getFullYear().toString().slice(-2);
   const cust = data.customerCode ? data.customerCode.toString().padStart(3, '0') : "000";
@@ -2044,14 +4934,645 @@ ipcMain.handle('calc:get-project-number', async (event, data) => {
   const mainId = `CA${yy}${po}${cust}`;
   const fullId = `${mainId}-${data.industry || 'XX'}${data.product || 'XXX'}${data.control || 'X'}${data.scope || 'XX'}`;
   
-  // Log to CSV
-  const customerName = DEFAULT_CUSTOMER_DATA[cust] || '';
-  await logNumberGeneration('Project', { mainId, fullId, customerCode: cust, customerName });
+  console.log('   Generated IDs: mainId="' + mainId + '", fullId="' + fullId + '"');
   
+  // Get customer name from DEFAULT_CUSTOMER_DATA or custom customers
+  let customerName = DEFAULT_CUSTOMER_DATA[cust] || '';
+  if (!customerName) {
+    try {
+      const customersPath = path.join(dataPath, 'customers', 'customers.json');
+      const customersData = await fs.readFile(customersPath, 'utf-8');
+      const customCustomers = JSON.parse(customersData);
+      const customer = customCustomers.find(c => c.id === cust);
+      customerName = customer ? customer.name : 'Unknown';
+    } catch (error) {
+      console.warn('   Could not load custom customers:', error.message);
+      customerName = 'Unknown';
+    }
+  }
+  
+  console.log('   Customer: "' + customerName + '" (' + cust + ')');
+  
+  // Log to CSV with full details
+  console.log('   Logging to CSV...');
+  try {
+    await logNumberGeneration('Project', { 
+      mainId, 
+      fullId, 
+      customerCode: cust, 
+      customerName,
+      industry: data.industry,
+      product: data.product,
+      control: data.control,
+      scope: data.scope,
+      poNumber: po
+    });
+    console.log('   ✅ CSV logging completed');
+  } catch (error) {
+    console.error('   ❌ CSV logging failed:', error);
+  }
+
+  // Store in main database
+  console.log('   Storing in main database...');
+  try {
+    if (serverDb) {
+      const now = new Date().toISOString();
+      await serverDb.run(`
+        INSERT INTO generated_numbers (
+          type, mainId, fullId, customerCode, customerName,
+          industry, product, control, scope, poNumber, generated_at, updated_at, updated_by
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        'project', mainId, fullId, cust, customerName,
+        data.industry || null, data.product || null, data.control || null, data.scope || null,
+        po, now, now, 'system'
+      ]);
+      console.log('   ✅ Stored in main database (serverDb)');
+    } else {
+      console.warn('   ⚠️ serverDb not available, skipping main database storage');
+    }
+  } catch (error) {
+    console.error('   ❌ Error storing project number in main database:', error);
+    console.error('      Error code:', error.code);
+    console.error('      Error message:', error.message);
+  }
+
+  // Store in generated numbers database
+  console.log('   Storing in generated numbers database...');
+  try {
+    if (generatedNumbersDb) {
+      const now = new Date().toISOString();
+      await generatedNumbersDb.run(`
+        INSERT INTO generated_numbers (
+          type, mainId, fullId, customerCode, customerName,
+          industry, product, control, scope, poNumber, generated_at, updated_at, updated_by
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        'project', mainId, fullId, cust, customerName,
+        data.industry || null, data.product || null, data.control || null, data.scope || null,
+        po, now, now, 'system'
+      ]);
+      console.log('   ✅ Stored in generated numbers database (generatedNumbersDb)');
+    } else {
+      console.warn('   ⚠️ generatedNumbersDb not available, skipping separate database storage');
+    }
+  } catch (error) {
+    console.error('   ❌ Error storing project number in generated numbers database:', error);
+    console.error('      Error code:', error.code);
+    console.error('      Error message:', error.message);
+  }
+
+  console.log('🔢 [Project Number Generator] Completed successfully');
   return { mainId, fullId };
 });
 
-// BOM Importer IPC handlers
+// Generated Numbers Query IPC handlers
+ipcMain.handle('calc:get-all-generated-numbers', async (event, options = {}) => {
+  try {
+    const { type, limit = 100, offset = 0 } = options;
+    
+    let query = 'SELECT * FROM generated_numbers';
+    const params = [];
+    
+    if (type) {
+      query += ' WHERE type = ?';
+      params.push(type);
+    }
+    
+    query += ' ORDER BY generated_at DESC LIMIT ? OFFSET ?';
+    params.push(limit, offset);
+    
+    if (generatedNumbersDb) {
+      const results = await generatedNumbersDb.all(query, params);
+      return results;
+    }
+    return [];
+  } catch (error) {
+    console.error('Error fetching generated numbers:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('calc:search-generated-numbers', async (event, searchTerm) => {
+  try {
+    if (!generatedNumbersDb) return [];
+    
+    const results = await generatedNumbersDb.all(`
+      SELECT * FROM generated_numbers
+      WHERE mainId LIKE ? OR fullId LIKE ? OR customerName LIKE ?
+      ORDER BY generated_at DESC
+      LIMIT 50
+    `, [`%${searchTerm}%`, `%${searchTerm}%`, `%${searchTerm}%`]);
+    
+    return results;
+  } catch (error) {
+    console.error('Error searching generated numbers:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('calc:get-stats', async () => {
+  try {
+    if (!generatedNumbersDb) return null;
+    
+    const stats = await generatedNumbersDb.get(`
+      SELECT 
+        COUNT(*) as total,
+        SUM(CASE WHEN type = 'quote' THEN 1 ELSE 0 END) as totalQuotes,
+        SUM(CASE WHEN type = 'project' THEN 1 ELSE 0 END) as totalProjects,
+        MAX(generated_at) as lastGenerated
+      FROM generated_numbers
+    `);
+    
+    return stats;
+  } catch (error) {
+    console.error('Error getting stats:', error);
+    throw error;
+  }
+});
+
+// Margin Calculator IPC handler - save to database
+ipcMain.handle('margin-calc:save', async (event, marginData) => {
+  console.log('💰 [Margin Calculator] Saving margin calculation to database...');
+  console.log('   Data:', JSON.stringify(marginData, null, 2));
+  
+  try {
+    if (!serverDb) {
+      throw new Error('Database not available');
+    }
+
+    const now = new Date().toISOString();
+    
+    // Save to manual_quotes table
+    await serverDb.run(`
+      INSERT INTO manual_quotes (
+        quoteNumber, type, data, projectName, customer, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(quoteNumber) DO UPDATE SET
+        type = excluded.type,
+        data = excluded.data,
+        projectName = excluded.projectName,
+        customer = excluded.customer,
+        updated_at = excluded.updated_at
+    `, [
+      marginData.quoteNumber || null,
+      'margin_calculation',
+      JSON.stringify({
+        mode: marginData.mode,
+        inputs: marginData.inputs,
+        results: marginData.results,
+        timestamp: now
+      }),
+      marginData.projectName || null,
+      marginData.customer || null,
+      now,
+      now
+    ]);
+
+    console.log('   ✅ Margin calculation saved to database');
+    return { success: true, message: 'Calculation saved successfully' };
+  } catch (error) {
+    console.error('   ❌ Error saving margin calculation:', error);
+    throw error;
+  }
+});
+
+// Margin Calculator IPC handler - retrieve by quote number
+ipcMain.handle('margin-calc:get', async (event, quoteNumber) => {
+  console.log('💰 [Margin Calculator] Retrieving calculation for quote:', quoteNumber);
+  
+  try {
+    if (!serverDb) {
+      throw new Error('Database not available');
+    }
+
+    const result = await serverDb.get(`
+      SELECT * FROM manual_quotes
+      WHERE quoteNumber = ? AND type = 'margin_calculation'
+      ORDER BY updated_at DESC
+      LIMIT 1
+    `, [quoteNumber]);
+
+    if (result) {
+      console.log('   ✅ Found saved calculation');
+      return {
+        success: true,
+        data: JSON.parse(result.data),
+        projectName: result.projectName,
+        customer: result.customer,
+        createdAt: result.created_at,
+        updatedAt: result.updated_at
+      };
+    } else {
+      console.log('   ℹ️ No calculation found for this quote number');
+      return { success: false, message: 'No calculation found' };
+    }
+  } catch (error) {
+    console.error('   ❌ Error retrieving margin calculation:', error);
+    throw error;
+  }
+});
+
+// Manual BOM Builder IPC handler - save to database
+ipcMain.handle('manual-bom:save', async (event, bomData) => {
+  console.log('📦 [Manual BOM] Saving BOM to database...');
+  console.log('   Quote Number:', bomData.quoteNumber);
+  
+  try {
+    if (!serverDb) {
+      throw new Error('Database not available');
+    }
+
+    const now = new Date().toISOString();
+    
+    // Save to manual_quotes table
+    await serverDb.run(`
+      INSERT INTO manual_quotes (
+        quoteNumber, type, data, projectName, customer, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(quoteNumber) DO UPDATE SET
+        type = excluded.type,
+        data = excluded.data,
+        projectName = excluded.projectName,
+        customer = excluded.customer,
+        updated_at = excluded.updated_at
+    `, [
+      bomData.quoteNumber || null,
+      'bom',
+      JSON.stringify({
+        bom: bomData.bom,
+        costData: bomData.costData,
+        timestamp: now
+      }),
+      bomData.projectName || null,
+      bomData.customer || null,
+      now,
+      now
+    ]);
+
+    console.log('   ✅ Manual BOM saved to database');
+    return { success: true, message: 'BOM saved successfully' };
+  } catch (error) {
+    console.error('   ❌ Error saving manual BOM:', error);
+    throw error;
+  }
+});
+
+// Manual BOM Builder IPC handler - retrieve by quote number
+ipcMain.handle('manual-bom:get', async (event, quoteNumber) => {
+  console.log('📦 [Manual BOM] Retrieving BOM for quote:', quoteNumber);
+  
+  try {
+    if (!serverDb) {
+      throw new Error('Database not available');
+    }
+
+    const result = await serverDb.get(`
+      SELECT * FROM manual_quotes
+      WHERE quoteNumber = ? AND type = 'bom'
+      ORDER BY updated_at DESC
+      LIMIT 1
+    `, [quoteNumber]);
+
+    if (result) {
+      console.log('   ✅ Found saved BOM');
+      return {
+        success: true,
+        data: JSON.parse(result.data),
+        projectName: result.projectName,
+        customer: result.customer,
+        createdAt: result.created_at,
+        updatedAt: result.updated_at
+      };
+    } else {
+      console.log('   ℹ️ No BOM found for this quote number');
+      return { success: false, message: 'No BOM found' };
+    }
+  } catch (error) {
+    console.error('   ❌ Error retrieving manual BOM:', error);
+    throw error;
+  }
+});
+
+// Separate database save handler for generated numbers
+ipcMain.handle('db:generated-numbers-separate:save', async (event, numberData) => {
+  try {
+    if (!generatedNumbersDb) {
+      throw new Error('Generated numbers database not available');
+    }
+
+    await generatedNumbersDb.run(`
+      INSERT INTO generated_numbers (
+        type, mainId, fullId, customerCode, customerName,
+        industry, product, control, scope, poNumber, generated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, [
+      numberData.type || 'quote',
+      numberData.mainId,
+      numberData.fullId,
+      numberData.customerCode,
+      numberData.customerName || null,
+      numberData.industry || null,
+      numberData.product || null,
+      numberData.control || null,
+      numberData.scope || null,
+      numberData.poNumber || null,
+      new Date().toISOString()
+    ]);
+
+    console.log(`✓ Saved ${numberData.type} number to separate database: ${numberData.fullId}`);
+    return { success: true };
+  } catch (error) {
+    console.error('Error saving to generated numbers separate database:', error);
+    throw error;
+  }
+});
+
+// Network credential IPC handlers
+ipcMain.handle('network:test-credentials', async (event, { username, password }) => {
+  try {
+    const success = await testNetworkConnection(username, password);
+    return { success, error: success ? null : 'Invalid credentials or network unreachable' };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('network:get-stored-credentials', async () => {
+  return await loadNetworkCredentials();
+});
+
+ipcMain.handle('network:save-credentials', async (event, { username, password }) => {
+  const success = await saveNetworkCredentials(username, password);
+  if (success) {
+    networkCredentials = { username };
+  }
+  return { success };
+});
+
+ipcMain.handle('network:clear-credentials', async () => {
+  try {
+    const { execSync } = await import('child_process');
+    execSync('cmdkey /delete:CraftAuto-Sales', { stdio: 'ignore' });
+    networkCredentials = null;
+    return { success: true };
+  } catch (err) {
+    console.error('Failed to clear network credentials:', err);
+    return { success: false, error: err.message };
+  }
+});
+
+// Enhanced runtime status with credential prompting
+ipcMain.handle('runtime:get-status-enhanced', async () => {
+  try {
+    const runtimeRoot = await resolveRuntimePathWithCredentials('', mainWindow);
+    const usingOverride = Boolean(resolvedRuntimeRoot) || Boolean(await initializeRuntimeConfig());
+    const status = {
+      runtimeRoot,
+      usingOverride,
+      ok: true,
+      message: usingOverride ? 'Runtime override active.' : 'Using local runtime.',
+      buildInfo: null,
+      buildInfoFileModified: null,
+      buildInfoAgeMinutes: null
+    };
+
+    try {
+      await fs.access(runtimeRoot);
+    } catch (err) {
+      status.ok = !usingOverride;
+      status.message = usingOverride
+        ? 'Runtime override unavailable: ' + err.message
+        : 'Local runtime unavailable: ' + err.message;
+      status.error = err.message;
+      return status;
+    }
+
+    const buildInfoPath = path.join(runtimeRoot, 'build-info.json');
+
+    try {
+      const content = await fs.readFile(buildInfoPath, 'utf-8');
+      const info = JSON.parse(content);
+      status.buildInfo = info;
+
+      const stats = await fs.stat(buildInfoPath);
+      status.buildInfoFileModified = stats.mtime.toISOString();
+
+      if (info?.timestampUtc) {
+        const parsed = Date.parse(info.timestampUtc);
+        if (!Number.isNaN(parsed)) {
+          status.buildInfoAgeMinutes = Math.round((Date.now() - parsed) / 60000);
+        }
+      }
+
+      if (usingOverride) {
+        const version = info?.version || 'unknown version';
+        const timestamp = info?.timestampUtc || status.buildInfoFileModified;
+        status.message = 'NAS build ' + version + ' @ ' + timestamp;
+      } else {
+        status.message = 'Using local runtime';
+      }
+    } catch (err) {
+      if (usingOverride) {
+        status.ok = false;
+        status.message = err.code === 'ENOENT'
+          ? 'NAS build-info.json not found'
+          : 'NAS runtime error: ' + err.message;
+        status.error = err.message;
+      } else {
+        status.message = 'Using local runtime';
+      }
+    }
+
+    return status;
+  } catch (err) {
+    console.error('Failed to resolve runtime status:', err);
+    return {
+      runtimeRoot: await resolveRuntimePath(),
+      usingOverride: Boolean(resolvedRuntimeRoot),
+      ok: false,
+      message: `Failed to resolve runtime status: ${err.message}`,
+      error: err.message
+    };
+  }
+});
+
+// Logical Assemblies IPC handlers
+
+// Get all logical assemblies
+ipcMain.handle('assemblies:getAll', async () => {
+  try {
+    const assembliesPath = path.join(dataPath, 'assemblies', 'assemblies.json');
+    
+    // Check if file exists
+    try {
+      await fs.access(assembliesPath);
+    } catch {
+      // File doesn't exist, return empty array
+      return [];
+    }
+    
+    const data = await fs.readFile(assembliesPath, 'utf-8');
+    return JSON.parse(data);
+  } catch (err) {
+    console.error('Error loading logical assemblies:', err);
+    return [];
+  }
+});
+
+// Save a logical assembly
+ipcMain.handle('assemblies:save', async (event, assemblyToSave) => {
+  try {
+    // Load assembly schema for validation
+    let assemblySchemaPath;
+    if (process.env.NODE_ENV === 'development' || !app.isPackaged) {
+      assemblySchemaPath = path.join(__dirname, '..', 'src', 'data', 'schemas', 'assembly_schema.json');
+    } else {
+      assemblySchemaPath = path.join(process.resourcesPath, 'app.asar', 'src', 'data', 'schemas', 'assembly_schema.json');
+    }
+    
+    const schemaData = await fs.readFile(assemblySchemaPath, 'utf-8');
+    const assemblySchema = JSON.parse(schemaData);
+    const ajv = new Ajv();
+    const validate = ajv.compile(assemblySchema);
+    
+    // Validate the assembly
+    const valid = validate(assemblyToSave);
+    if (!valid) {
+      return { success: false, errors: validate.errors };
+    }
+    
+    // Ensure assemblies directory exists
+    const assembliesDir = path.join(dataPath, 'assemblies');
+    await fs.mkdir(assembliesDir, { recursive: true });
+    
+    const assembliesPath = path.join(assembliesDir, 'assemblies.json');
+    
+    // Read existing assemblies
+    let assemblies = [];
+    try {
+      await fs.access(assembliesPath);
+      const data = await fs.readFile(assembliesPath, 'utf-8');
+      assemblies = JSON.parse(data);
+    } catch {
+      // File doesn't exist, start with empty array
+      assemblies = [];
+    }
+    
+    // Find and replace or add new
+    const existingIndex = assemblies.findIndex(a => a.assemblyId === assemblyToSave.assemblyId);
+    if (existingIndex >= 0) {
+      assemblies[existingIndex] = assemblyToSave;
+    } else {
+      assemblies.push(assemblyToSave);
+    }
+    
+    // Save back to file
+    await fs.writeFile(assembliesPath, JSON.stringify(assemblies, null, 2), 'utf-8');
+    console.log(`✓ Logical assembly saved to: ${assembliesPath}`);
+    console.log(`  - Assembly ID: ${assemblyToSave.assemblyId}`);
+    console.log(`  - Display Name: ${assemblyToSave.displayName}`);
+    console.log(`  - Total assemblies in file: ${assemblies.length}`);
+    
+    return { success: true, data: assemblyToSave };
+  } catch (err) {
+    console.error('Error saving logical assembly:', err);
+    throw err;
+  }
+});
+
+// Get logical assembly by ID
+ipcMain.handle('assemblies:getById', async (event, assemblyId) => {
+  try {
+    const assembliesPath = path.join(dataPath, 'assemblies', 'assemblies.json');
+    
+    try {
+      await fs.access(assembliesPath);
+    } catch {
+      return null;
+    }
+    
+    const data = await fs.readFile(assembliesPath, 'utf-8');
+    const assemblies = JSON.parse(data);
+    return assemblies.find(a => a.assemblyId === assemblyId) || null;
+  } catch (err) {
+    console.error('Error getting logical assembly by ID:', err);
+    throw err;
+  }
+});
+
+// Delete a logical assembly
+ipcMain.handle('assemblies:delete', async (event, assemblyId) => {
+  try {
+    const assembliesPath = path.join(dataPath, 'assemblies', 'assemblies.json');
+    
+    let assemblies = [];
+    try {
+      await fs.access(assembliesPath);
+      const data = await fs.readFile(assembliesPath, 'utf-8');
+      assemblies = JSON.parse(data);
+    } catch {
+      return { success: false, error: 'Assemblies file not found' };
+    }
+    
+    const initialLength = assemblies.length;
+    assemblies = assemblies.filter(a => a.assemblyId !== assemblyId);
+    
+    await fs.writeFile(assembliesPath, JSON.stringify(assemblies, null, 2), 'utf-8');
+    
+    return { success: true, changes: initialLength - assemblies.length };
+  } catch (err) {
+    console.error('Error deleting logical assembly:', err);
+    throw err;
+  }
+});
+
+// Search logical assemblies by filters
+ipcMain.handle('assemblies:search', async (event, filters) => {
+  try {
+    const assemblies = await ipcMain.handle('assemblies:getAll');
+    
+    let results = assemblies;
+    
+    if (filters.category) {
+      results = results.filter(a => a.category?.toLowerCase().includes(filters.category.toLowerCase()));
+    }
+    if (filters.assemblyId) {
+      results = results.filter(a => a.assemblyId?.toLowerCase().includes(filters.assemblyId.toLowerCase()));
+    }
+    if (filters.displayName) {
+      results = results.filter(a => a.displayName?.toLowerCase().includes(filters.displayName.toLowerCase()));
+    }
+    if (filters.description) {
+      results = results.filter(a => a.description?.toLowerCase().includes(filters.description.toLowerCase()));
+    }
+    if (filters.tags && Array.isArray(filters.tags)) {
+      results = results.filter(a => {
+        if (!a.tags || !Array.isArray(a.tags)) return false;
+        return filters.tags.some(tag => a.tags.some(assemblyTag => 
+          assemblyTag.toLowerCase().includes(tag.toLowerCase())
+        ));
+      });
+    }
+    
+    return results;
+  } catch (err) {
+    console.error('Error searching logical assemblies:', err);
+    return [];
+  }
+});
+
+// Get unique categories from logical assemblies
+ipcMain.handle('assemblies:getCategories', async () => {
+  try {
+    const assemblies = await ipcMain.handle('assemblies:getAll');
+    const categories = [...new Set(assemblies.map(a => a.category).filter(Boolean))];
+    return categories.sort();
+  } catch (err) {
+    console.error('Error getting assembly categories:', err);
+    return [];
+  }
+});
 
 // Smart CSV header detection - finds the header row automatically
 ipcMain.handle('bom-importer:get-csv-headers', async (event, csvContent) => {
@@ -2103,23 +5624,23 @@ ipcMain.handle('bom-importer:process-import', async (event, { csvContent, header
     const parsed = Papa.parse(csvFromHeader, { header: true, skipEmptyLines: true });
     console.log(`Parsed ${parsed.data.length} rows from CSV`);
     
-    // 2. Determine paths - assemblies.json is in root dataPath, not assemblies subfolder
-    const assembliesPath = path.join(dataPath, 'assemblies.json');
+    // 2. Determine paths - sub_assemblies.json is in root dataPath
+    const subAssembliesPath = path.join(dataPath, 'sub_assemblies.json');
     const masterListPath = path.join(dataPath, 'schemas', 'product_master_list.json');
-    const templatesPath = path.join(dataPath, 'product-templates');
+    const templatesPath = await resolveRuntimePathWithCredentials('product-templates', mainWindow);
     
     // Ensure directories exist
     await fs.mkdir(path.join(dataPath, 'schemas'), { recursive: true });
     await fs.mkdir(templatesPath, { recursive: true });
     
     // 3. Load data files
-    let assemblies = [];
+    let subAssemblies = [];
     try {
-      const assembliesData = fssync.readFileSync(assembliesPath, 'utf-8');
-      assemblies = JSON.parse(assembliesData);
+      const assembliesData = fssync.readFileSync(subAssembliesPath, 'utf-8');
+      subAssemblies = JSON.parse(assembliesData);
     } catch (err) {
-      console.log('Creating new assemblies.json');
-      assemblies = [];
+      console.log('Creating new sub_assemblies.json');
+      subAssemblies = [];
     }
     
     let masterList = [];
@@ -2147,10 +5668,10 @@ ipcMain.handle('bom-importer:process-import', async (event, { csvContent, header
     }
     
     // 4. Create lookup maps - track assemblies by a unique key combining product and assembly name
-    const assemblyLookup = new Map();
+    const subAssemblyLookup = new Map();
     
     // Track stats
-    const initialAssemblyCount = assemblies.length;
+    const initialSubAssemblyCount = subAssemblies.length;
     const updatedProducts = new Set();
     
     // 5. Process each row
@@ -2166,7 +5687,7 @@ ipcMain.handle('bom-importer:process-import', async (event, { csvContent, header
         continue;
       }
       
-      console.log(`Processing: Product="${productName}", Assembly="${assemblyName}", SKU="${sku}"`);
+      console.log(`Processing: Product="${productName}", Sub-Assembly="${assemblyName}", SKU="${sku}"`);
       
       // Build attributes object from optional columns
       const attributes = {};
@@ -2194,10 +5715,10 @@ ipcMain.handle('bom-importer:process-import', async (event, { csvContent, header
       }
       
       // 7. Find or create assembly - use product+assembly name as unique key
-      const assemblyKey = `${productName}::${assemblyName}`;
-      let assembly = assemblyLookup.get(assemblyKey);
+      const subAssemblyKey = `${productName}::${assemblyName}`;
+      let subAssembly = subAssemblyLookup.get(subAssemblyKey);
       
-      if (!assembly) {
+      if (!subAssembly) {
         // Create new assembly with random ID
         const randomId = Date.now().toString(36).toUpperCase() + Math.random().toString(36).substring(2, 6).toUpperCase();
         
@@ -2206,24 +5727,25 @@ ipcMain.handle('bom-importer:process-import', async (event, { csvContent, header
           ? row[columnMap.assemblyDescription] 
           : assemblyName;
         
-        assembly = {
-          assemblyId: `ASM-${randomId}`,
+        subAssembly = {
+          subAssemblyId: `SA-${randomId}`,
+          assemblyId: `SA-${randomId}`,
           description: assemblyDesc,
           category: row[columnMap.category] || 'Uncategorized',
           attributes: {},
           components: []
         };
-        assemblies.push(assembly);
-        assemblyLookup.set(assemblyKey, assembly);
+        subAssemblies.push(subAssembly);
+        subAssemblyLookup.set(subAssemblyKey, subAssembly);
       }
       
       // 8. Update assembly attributes (merge with existing)
-      Object.assign(assembly.attributes, attributes);
+      Object.assign(subAssembly.attributes, attributes);
       
       // 9. Add component to assembly (check for duplicates)
-      const existingComponent = assembly.components.find(c => c.sku === sku);
+      const existingComponent = subAssembly.components.find(c => c.sku === sku);
       if (!existingComponent) {
-        assembly.components.push({
+        subAssembly.components.push({
           sku,
           quantity,
           notes: row[columnMap.notes] || ''
@@ -2232,7 +5754,7 @@ ipcMain.handle('bom-importer:process-import', async (event, { csvContent, header
       
       // 10. Update product template
       if (!templates[productCode]) {
-        // Create new product template
+        // Create new product template placeholder (legacy structure - will be migrated)
         templates[productCode] = {
           productCode,
           productName: masterList.find(p => p.code === productCode)?.name || productName,
@@ -2243,18 +5765,18 @@ ipcMain.handle('bom-importer:process-import', async (event, { csvContent, header
         };
       }
       
-      // Add assembly to product template's optional list
-      if (!templates[productCode].assemblies.optional.includes(assembly.assemblyId)) {
-        templates[productCode].assemblies.optional.push(assembly.assemblyId);
+      // Add sub-assembly to product template's optional list (legacy structure)
+      if (!templates[productCode].assemblies.optional.includes(subAssembly.subAssemblyId)) {
+        templates[productCode].assemblies.optional.push(subAssembly.subAssemblyId);
       }
       
       updatedProducts.add(productCode);
     }
     
     // 11. Write all updated data back to files
-    console.log(`Writing ${assemblies.length} assemblies to file: ${assembliesPath}`);
-    await fs.writeFile(assembliesPath, JSON.stringify(assemblies, null, 2));
-    console.log(`Successfully wrote assemblies to: ${assembliesPath}`);
+    console.log(`Writing ${subAssemblies.length} sub-assemblies to file: ${subAssembliesPath}`);
+    await fs.writeFile(subAssembliesPath, JSON.stringify(subAssemblies, null, 2));
+    console.log(`Successfully wrote sub-assemblies to: ${subAssembliesPath}`);
     console.log(`Writing ${masterList.length} products to master list...`);
     await fs.writeFile(masterListPath, JSON.stringify(masterList, null, 2));
     
@@ -2267,14 +5789,14 @@ ipcMain.handle('bom-importer:process-import', async (event, { csvContent, header
     
     const result = {
       success: true,
-      assembliesCreated: assemblies.length - initialAssemblyCount,
+      subAssembliesCreated: subAssemblies.length - initialSubAssemblyCount,
       productsUpdated: updatedProducts.size
     };
     console.log('=== BOM Import Complete ===', result);
     
-    // Invalidate the assembly cache so Assembly Manager sees the new assemblies
-    cachedAllAssemblies = await getAllAssemblies();
-    console.log(`Cache refreshed with ${cachedAllAssemblies.length} assemblies`);
+    // Invalidate the sub-assembly cache so Sub-Assembly Manager sees the new data
+    cachedSubAssemblies = await getAllSubAssemblies();
+    console.log(`Cache refreshed with ${cachedSubAssemblies.length} sub-assemblies`);
     
     return result;
     

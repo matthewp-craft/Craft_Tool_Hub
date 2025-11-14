@@ -6,55 +6,117 @@
 
 ## 📦 Distribution Options
 
-### Option 1: NAS-Based Installation (Recommended)
+### Option 1: NAS-Based Installation (Recommended) 🎯
 
-**Best for**: Small teams, easy updates, centralized control
+**Best for**: Small teams, easy updates, centralized control, automated deployment
 
-#### Setup on NAS
+#### Automated Setup with PowerShell Script
 
-1. **Create shared folder structure**:
-   ```
-   \\NAS\Software\CraftToolsHub\
-   ├── Current\
-   │   └── Craft-Tools-Hub-Setup.exe
-   ├── Versions\
-   │   ├── v1.0.0\
-   │   ├── v1.1.0\
-   │   └── v1.2.0\
-   ├── Portable\
-   │   └── CraftToolsHub-Portable\
-   │       ├── Craft Tools Hub.exe
-   │       └── resources\
-   └── Documentation\
-       ├── USER_GUIDE.md
-       ├── QUICK_START.md
-       └── CHANGELOG.md
-   ```
+The repository includes `scripts/publish-to-nas.ps1` that automates the entire deployment:
 
-2. **Set permissions**:
-   - Everyone: Read & Execute
-   - IT/Admin: Full Control
+```powershell
+# Deploy to NAS (default: \\192.168.1.99\CraftAuto-Sales\Temp_Craft_Tools_Runtime)
+.\scripts\publish-to-nas.ps1
 
-3. **Create shortcut** for users:
-   - Target: `\\NAS\Software\CraftToolsHub\Current\Craft-Tools-Hub-Setup.exe`
-   - Description: "Install Craft Tools Hub"
+# Deploy specific version
+.\scripts\publish-to-nas.ps1 -Version "v1.0.0"
+
+# Skip build (use existing artifacts)
+.\scripts\publish-to-nas.ps1 -SkipBuild
+
+# Custom NAS path
+.\scripts\publish-to-nas.ps1 -TargetPath "\\NAS\Apps\CraftToolsHub"
+```
+
+**What the script does:**
+- ✅ Builds the app (`npm run build`)
+- ✅ Creates versioned folder structure (`updates/v1.0rc/`)
+- ✅ Maintains `latest` pointer for auto-updates
+- ✅ Syncs all necessary files (dist, plugins, configs, server/)
+- ✅ Generates build metadata with Git info
+- ✅ Creates workstation setup scripts
+- ✅ Uses Robocopy for efficient mirroring
+
+#### Folder Structure Created
+
+```
+\\192.168.1.99\CraftAuto-Sales\Temp_Craft_Tools_Runtime\
+├── updates/
+│   ├── v1.0rc/              # Versioned deployment
+│   │   ├── dist/           # Built frontend
+│   │   ├── dist-electron/  # Electron main process
+│   │   ├── electron/       # Electron source
+│   │   ├── public/         # Static assets
+│   │   ├── plugins/        # All plugin modules
+│   │   ├── src/            # React source
+│   │   ├── server/         # API server with SQLite database
+│   │   ├── docs/           # Documentation
+│   │   ├── OUTPUT/         # Logs folder
+│   │   ├── package.json
+│   │   ├── build-info.json # Version metadata
+│   │   ├── run-app.bat     # Launch script
+│   │   └── ... (all config files)
+│   └── latest/             # Always points to newest
+├── runtime.env.example      # Example env variable
+├── Set-CTHRuntimeRoot.ps1   # Workstation setup (PowerShell)
+└── Set-CTHRuntimeRoot.bat   # Workstation setup (Batch)
+```
+
+#### Database Setup
+
+**SQLite Database**: `server/craft_tools.db`
+- Contains 1,335+ components from master pricelist
+- Automatically created during deployment
+- Shared across all users
+- No per-user database setup needed
+
+#### Permissions Setup
+
+- **Everyone**: Read & Execute
+- **IT/Admin**: Full Control
+- **Developer**: Modify (for publish script)
 
 #### User Installation
 
-**First Time**:
-```
-1. Navigate to \\NAS\Software\CraftToolsHub\Current\
-2. Double-click Craft-Tools-Hub-Setup.exe
-3. Follow installation wizard
-4. App installs to: C:\Users\[Username]\AppData\Local\craft-tools-hub\
-```
+**First Time Setup**:
+
+1. **Set Environment Variable** (choose one):
+   ```powershell
+   # PowerShell (User scope)
+   \\192.168.1.99\CraftAuto-Sales\Temp_Craft_Tools_Runtime\Set-CTHRuntimeRoot.ps1
+
+   # PowerShell (Machine scope - requires admin)
+   \\192.168.1.99\CraftAuto-Sales\Temp_Craft_Tools_Runtime\Set-CTHRuntimeRoot.ps1 -Scope Machine
+
+   # Batch (User scope)
+   \\192.168.1.99\CraftAuto-Sales\Temp_Craft_Tools_Runtime\Set-CTHRuntimeRoot.bat
+
+   # Batch (Machine scope - requires admin)
+   \\192.168.1.99\CraftAuto-Sales\Temp_Craft_Tools_Runtime\Set-CTHRuntimeRoot.bat /machine
+   ```
+
+2. **Launch App**:
+   ```
+   \\192.168.1.99\CraftAuto-Sales\Temp_Craft_Tools_Runtime\updates\latest\run-app.bat
+   ```
+   Or create desktop shortcut to this location.
+
+3. **First Launch**:
+   - Creates user data folder at `%APPDATA%\electron-vite-react-app`
+   - Connects to shared SQLite database on NAS
+   - Loads component database from NAS
+   - Ready to use!
 
 **Advantages**:
-- ✅ Single source of truth
-- ✅ Easy updates (replace file on NAS)
-- ✅ No email distribution needed
-- ✅ Version control built-in
+- ✅ Single source of truth for components
+- ✅ Automated deployment script
+- ✅ Version tracking with Git metadata
+- ✅ Zero-downtime updates (latest folder)
+- ✅ Easy rollback (previous versions preserved)
+- ✅ No per-machine installation needed
 - ✅ Network-accessible documentation
+- ✅ Shared database prevents sync issues
+- ✅ Build metadata for troubleshooting
 
 ---
 
@@ -137,35 +199,47 @@ const updateCheckUrl = "\\\\NAS\\Software\\CraftToolsHub\\version.json";
 
 #### When You Have a New Version:
 
-1. **Build the installer**:
+1. **Pull Latest Code**:
    ```bash
-   npm run electron:build
+   git pull origin quote_config
    ```
 
-2. **Test locally first**:
+2. **Test Locally** (optional but recommended):
    ```bash
-   # Install and verify
-   release/Craft-Tools-Hub-Setup-1.1.0.exe
+   npm run electron:dev
+   # Verify features work as expected
    ```
 
-3. **Deploy to NAS**:
+3. **Deploy to NAS** (One Command!):
    ```powershell
-   # Archive old version
-   Copy-Item "\\NAS\Software\CraftToolsHub\Current\*" `
-            -Destination "\\NAS\Software\CraftToolsHub\Versions\v1.0.0\"
+   # Navigate to repository root
+   cd C:\Users\CraftAuto-Sales\cth\craft_tools_hub
    
-   # Deploy new version
-   Copy-Item "release\Craft-Tools-Hub-Setup-1.1.0.exe" `
-            -Destination "\\NAS\Software\CraftToolsHub\Current\Craft-Tools-Hub-Setup.exe"
+   # Deploy with version tag
+   .\scripts\publish-to-nas.ps1 -Version "v1.1.0"
    
-   # Update changelog
-   Copy-Item "CHANGELOG.md" `
-            -Destination "\\NAS\Software\CraftToolsHub\Documentation\"
+   # Or use default version (v1.0rc)
+   .\scripts\publish-to-nas.ps1
    ```
 
-4. **Notify users**:
-   - Email: "New version available on NAS"
-   - Or: Update checker notifies automatically
+   **What happens:**
+   - ✅ Builds renderer and Electron (`npm run build`)
+   - ✅ Creates `updates/v1.1.0/` with all files
+   - ✅ Updates `latest/` folder automatically
+   - ✅ Generates `build-info.json` with Git metadata
+   - ✅ Creates workstation setup scripts
+   - ✅ Previous versions preserved for rollback
+
+4. **Verify Deployment**:
+   ```powershell
+   # Check build info
+   Get-Content "\\192.168.1.99\CraftAuto-Sales\Temp_Craft_Tools_Runtime\updates\latest\build-info.json"
+   ```
+
+5. **Notify Users**:
+   - Email: "New version v1.1.0 available on NAS"
+   - Users just need to restart the app
+   - No reinstallation required!
 
 ### For Users
 

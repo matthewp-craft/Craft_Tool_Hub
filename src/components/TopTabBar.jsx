@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Wrench, Box, FileText, Search } from 'lucide-react';
 import { useAppContext } from '../context/AppContext';
@@ -6,6 +6,7 @@ import { useAppContext } from '../context/AppContext';
 export default function TopTabBar({ activeTab, setActiveTab }) {
   const navigate = useNavigate();
   const { openSearchModal } = useAppContext();
+  const [logoUrl, setLogoUrl] = useState('/Craft_Logo.png');
   
   const tabs = [
     { id: 'TOOLS', label: 'TOOLS', icon: Wrench },
@@ -13,8 +14,29 @@ export default function TopTabBar({ activeTab, setActiveTab }) {
     { id: 'QUOTING', label: 'QUOTING', icon: FileText }
   ];
 
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadLogo = async () => {
+      try {
+        const logo = await window.api.getLogoUrl();
+        if (!cancelled) {
+          setLogoUrl(logo);
+        }
+      } catch (error) {
+        console.error('Failed to load logo URL:', error);
+      }
+    };
+
+    loadLogo();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   return (
-    <header className="bg-white dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700 shadow-sm">
+    <header className="bg-card border-b border-border shadow-sm">
       <div className="flex items-center h-16 px-6">
         {/* Logo - Clickable to go home */}
         <button 
@@ -22,7 +44,7 @@ export default function TopTabBar({ activeTab, setActiveTab }) {
           className="flex items-center mr-8 hover:opacity-80 transition-opacity"
           title="Go to Home"
         >
-          <img src="/Craft_Logo.png" alt="Craft Logo" className="h-10 w-auto" />
+          <img src={logoUrl} alt="Craft Logo" className="h-10 w-auto" />
         </button>
 
         {/* Tab Navigation */}
@@ -37,14 +59,14 @@ export default function TopTabBar({ activeTab, setActiveTab }) {
                 onClick={() => setActiveTab(tab.id)}
                 className={`flex items-center px-6 py-4 font-medium text-sm transition-colors relative ${
                   isActive
-                    ? 'text-blue-600 dark:text-blue-400'
-                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+                    ? 'text-primary'
+                    : 'text-muted-foreground hover:text-foreground'
                 }`}
               >
                 <Icon className="h-4 w-4 mr-2" />
                 {tab.label}
                 {isActive && (
-                  <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-blue-600 dark:bg-blue-400" />
+                  <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary" />
                 )}
               </button>
             );
@@ -57,17 +79,16 @@ export default function TopTabBar({ activeTab, setActiveTab }) {
         {/* Search Button */}
         <button
           onClick={openSearchModal}
-          className="flex items-center gap-2 px-4 py-2 mr-4 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-md transition-colors"
+          className="flex items-center justify-center w-10 h-10 mr-4 text-muted-foreground hover:text-foreground hover:bg-muted rounded-md transition-colors"
           title="Search Components (Ctrl+K)"
         >
-          <Search size={16} />
-          Search
+          <Search size={20} />
         </button>
 
-        {/* Optional: User/Settings area */}
-        <div className="flex items-center space-x-4">
-          <span className="text-sm text-slate-600 dark:text-slate-400">
-            Craft Tools Hub
+        {/* App Title */}
+        <div className="flex items-center ml-4">
+          <span className="text-sm text-muted-foreground">
+            Craft Automation CPQ
           </span>
         </div>
       </div>
